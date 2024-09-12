@@ -3,6 +3,8 @@
 *.save
 
 # ignore specific generated files
-logger_bpfeb
-logger_bpfel
+logger_bpfeb.go
+logger_bpfeb.o
+logger_bpfel.go
+logger_bpfel.o
 ebpf-logger
