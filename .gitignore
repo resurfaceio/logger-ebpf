@@ -1,0 +1,8 @@
+# ignore all object and save file types
+*.o
+*.save
+
+# ignore specific generated files
+logger_bpfeb
+logger_bpfel
+ebpf-logger
