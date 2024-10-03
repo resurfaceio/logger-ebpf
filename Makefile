@@ -1,13 +1,13 @@
-PROJECT_NAME=ebpf-logger
+PROJECT_NAME=logger-ebpf
 
-build:
-	@rm ebpf-logger logger_bpfel.go logger_bpfeb.go  logger_bpfeb.o logger_bpfel.o
-	@go generate
-	@go build
-	@sudo ./ebpf-logger
+run: build
+    sudo ./ebpf-logger
+build: clean
+	go generate
+	go build
 build-ebpf:
-	@go generate
+	go generate
 build-go:
-	@go build
+	go build
 clean:
-	@rm ebpf-logger logger_bpfel.go logger_bpfeb.go  logger_bpfeb.o logger_bpfel.o
+	rm -f ebpf-logger logger_bpfel.go logger_bpfeb.go logger_bpfeb.o logger_bpfel.o
