@@ -8,3 +8,10 @@ logger_bpfeb.o
 logger_bpfel.go
 logger_bpfel.o
 ebpf-logger
+
+# ignore OS and IDE project files
+.DS_Store
+.idea
+*.iml
+target/
+.vscode
