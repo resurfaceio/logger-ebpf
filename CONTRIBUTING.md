@@ -18,7 +18,7 @@ go version
 
 Install required packages:
 ```bash
-sudo apt install clang libbpf-dev make
+sudo apt install clang git libbpf-dev make
 ```
 
 Add required soft link:
@@ -37,5 +37,5 @@ export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu/
 cd $HOME
 git clone https://github.com/resurfaceio/logger-ebpf.git
 cd logger-ebpf
-make run
+make build run
 ```

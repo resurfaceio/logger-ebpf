@@ -1,7 +1,7 @@
 PROJECT_NAME=logger-ebpf
 
-run: build
-    sudo ./ebpf-logger
+run:
+	sudo ./ebpf-logger
 build: clean
 	go generate
 	go build
