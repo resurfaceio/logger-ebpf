@@ -1,11 +1,11 @@
 package main
 
 import (
-	"log"
 	"fmt"
-	"time"
+	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
@@ -28,40 +28,78 @@ func main() {
 
 	//---------------------------------------------------------
 
-	// Attach Hello to the accept4 system call.
-	opts := &link.KprobeOptions {}
-	link, err := link.Kprobe("__sys_read", objs.BPF_KSYSCALL, opts)
+	// Attach Hello to the read system call.
+	// opts := &link.KprobeOptions{}
+	l, err := link.Kprobe("sys_read", objs.SyscallProbeEntryRead, nil)
 	if err != nil {
 		log.Fatal("Attaching kprobe:", err)
 	}
-	info, err := link.Info()
+	info, err := l.Info()
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(*info)
-	defer link.Close()
+	fmt.Println("- Link [kprobe/sys_read]:", *info)
+	defer l.Close()
+
+	l2, err := link.Kretprobe("sys_read", objs.SyscallProbeReturnRead, nil)
+	if err != nil {
+		log.Fatal("Attaching kretprobe:", err)
+	}
+	info, err = l2.Info()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("- Link [kretprobe/sys_read]:", *info)
+	defer l2.Close()
 
 	tick := time.Tick(time.Second)
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
-	type Output interface {
-		fd() int
-		buf() string
-	}
+	// type Output interface {
+	// 	fd() int
+	// 	buf() string
+	// }
 
 	for {
 		select {
 		case <-tick:
-			var valueOut Output;
-			err := objs.ActiveReadArgsMap.Lookup(uint32(0), valueOut);
-			if err != nil {
-				log.Fatal("Map lookup:", err);
+			var (
+				key   uint32
+				value string
+				// entries = objs.EntryStashMap.Iterate()
+				entries = objs.ActiveReadArgsMap.Iterate()
+			)
+			values := make(map[uint32]string)
+
+			// ok := entries.Next(&key, &value)
+			// log.Print(ok)
+
+			for entries.Next(&key, &value) {
+				values[key] = value
 			}
-			log.Printf("%d system calls made...");
+
+			if err := entries.Err(); err != nil {
+				log.Fatal("Iterator encountered an error:", err)
+			}
+
+			for k, v := range values {
+				log.Printf("key: %d, value: %s\n", k, v)
+			}
+
+			// var valueOut string
+			// err := objs.ActiveReadArgsMap.Lookup(uint32(0), &valueOut)
+			// if err != nil {
+			// 	log.Print("Map lookup:", err)
+			// }
+			// if valueOut != "" {
+			// 	log.Print(valueOut)
+			// }
+			// return
+			// log.Printf("%d system calls made...")
 		case <-stop:
-			log.Print("Received signal, exiting...");
-			return;
+			log.Print("Received signal, exiting...")
+			return
 		}
 	}
 }
