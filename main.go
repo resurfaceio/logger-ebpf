@@ -2,14 +2,16 @@ package main
 
 import (
 	"log"
-	"fmt"
-	"time"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+const MAX_BYTES_READ int = 500
+const SEP string = "🗣️ 📢 🔥🔥🔥"
 
 func main() {
 	// Remove resource limits for kernels <5.11.
@@ -28,40 +30,75 @@ func main() {
 
 	//---------------------------------------------------------
 
-	// Attach Hello to the accept4 system call.
-	opts := &link.KprobeOptions {}
-	link, err := link.Kprobe("__sys_read", objs.BPF_KSYSCALL, opts)
+	// Attach probes to the read system call.
+	entrylink, err := link.Kprobe("sys_read", objs.EntryRead, nil)
 	if err != nil {
 		log.Fatal("Attaching kprobe:", err)
 	}
-	info, err := link.Info()
+	defer entrylink.Close()
+
+	retlink, err := link.Kretprobe("sys_read", objs.RetRead, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Attaching kretprobe:", err)
 	}
-	fmt.Println(*info)
-	defer link.Close()
+	defer retlink.Close()
 
 	tick := time.Tick(time.Second)
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
-	type Output interface {
-		fd() int
-		buf() string
+	type Out struct {
+		Fd   uint32
+		Data [MAX_BYTES_READ]byte
 	}
+
+	var debugkey string
 
 	for {
 		select {
 		case <-tick:
-			var valueOut Output;
-			err := objs.ActiveReadArgsMap.Lookup(uint32(0), valueOut);
-			if err != nil {
-				log.Fatal("Map lookup:", err);
+			var (
+				key   uint32
+				value Out
+				//				value string
+				//entries = objs.StashMap.Iterate()
+				entries = objs.ActiveReadArgsMap.Iterate()
+			)
+			//			values := make(map[uint32]string)
+			values := make(map[uint32]Out)
+
+			//ok := entries.Next(&key, &value)
+			//log.Print(ok)
+
+			for entries.Next(&key, &value) {
+				values[key] = value
 			}
-			log.Printf("%d system calls made...");
+
+			if err := entries.Err(); err != nil {
+				log.Fatal("Iterator encountered an error:", err)
+			}
+
+			for k, v := range values {
+				if k == 0 {
+					debugkey = "KPROBE: count"
+				} else if k == 1 {
+					debugkey = "KRETPROBE: error"
+				} else if k == 2 {
+					debugkey = "KRETPROBE: read OK"
+				} else {
+					debugkey = "UNKNOWN"
+				}
+				log.Printf("[DEBUG %s]\nkey: %d \nvalue:\n - fd: %d\n - message:\n\"%s\"\n%s\n", debugkey, k, v.Fd, v.Data, SEP)
+			}
+			//			var valueOut Out;
+			//			err := objs.ActiveReadArgsMap.Lookup(uint32(0), &valueOut);
+			//			if err != nil {
+			//				log.Fatal("Map lookup:", err);
+			//			}
+			//			log.Print(valueOut.V);
 		case <-stop:
-			log.Print("Received signal, exiting...");
-			return;
+			log.Print("Received signal, exiting...")
+			return
 		}
 	}
 }
