@@ -58,17 +58,11 @@ func main() {
 		select {
 		case <-tick:
 			var (
-				key   uint32
-				value Out
-				//				value string
-				//entries = objs.StashMap.Iterate()
+				key     uint32
+				value   Out
 				entries = objs.ActiveReadArgsMap.Iterate()
 			)
-			//			values := make(map[uint32]string)
 			values := make(map[uint32]Out)
-
-			//ok := entries.Next(&key, &value)
-			//log.Print(ok)
 
 			for entries.Next(&key, &value) {
 				values[key] = value
@@ -90,12 +84,6 @@ func main() {
 				}
 				log.Printf("[DEBUG %s]\nkey: %d \nvalue:\n - fd: %d\n - message:\n\"%s\"\n%s\n", debugkey, k, v.Fd, v.Data, SEP)
 			}
-			//			var valueOut Out;
-			//			err := objs.ActiveReadArgsMap.Lookup(uint32(0), &valueOut);
-			//			if err != nil {
-			//				log.Fatal("Map lookup:", err);
-			//			}
-			//			log.Print(valueOut.V);
 		case <-stop:
 			log.Print("Received signal, exiting...")
 			return
