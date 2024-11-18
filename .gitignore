@@ -7,7 +7,10 @@ logger_bpfeb.go
 logger_bpfeb.o
 logger_bpfel.go
 logger_bpfel.o
+logger_x86_bpfel.go
+logger_x86_bpfel.o
 ebpf-logger
+vmlinux.h
 
 # ignore OS and IDE project files
 .DS_Store
