@@ -10,7 +10,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-const MAX_BYTES_READ int = 500
+const MAX_BYTES int = 500
 const SEP string = "🗣️ 📢 🔥🔥🔥"
 
 func main() {
@@ -30,60 +30,64 @@ func main() {
 
 	//---------------------------------------------------------
 
-	// Attach probes to the read system call.
-	entrylink, err := link.Kprobe("sys_read", objs.EntryRead, nil)
-	if err != nil {
-		log.Fatal("Attaching kprobe:", err)
-	}
-	defer entrylink.Close()
+	// Attach probes to OpenSSL executable.
 
-	retlink, err := link.Kretprobe("sys_read", objs.RetRead, nil)
+	ex, err := link.OpenExecutable("/lib/x86_64-linux-gnu/libssl.so.3")
+	if err != nil {
+		log.Fatal("Opening executable:", err)
+	}
+
+	entrylinkr, err := ex.Uprobe("SSL_read", objs.EntrySsl, nil)
+	if err != nil {
+		log.Fatal("Attaching uprobe:", err)
+	}
+	defer entrylinkr.Close()
+
+	entrylinkw, err := ex.Uprobe("SSL_write", objs.EntrySsl, nil)
+	if err != nil {
+		log.Fatal("Attaching uprobe:", err)
+	}
+	defer entrylinkw.Close()
+
+	retlinkr, err := ex.Uretprobe("SSL_read", objs.RetSslRead, nil)
 	if err != nil {
 		log.Fatal("Attaching kretprobe:", err)
 	}
-	defer retlink.Close()
+	defer retlinkr.Close()
+
+	retlinkw, err := ex.Uretprobe("SSL_write", objs.RetSslWrite, nil)
+	if err != nil {
+		log.Fatal("Attaching kretprobe:", err)
+	}
+	defer retlinkw.Close()
 
 	tick := time.Tick(time.Second)
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
 	type Out struct {
-		Fd   uint32
-		Data [MAX_BYTES_READ]byte
+		Id  uint32
+		Buf [MAX_BYTES]byte
 	}
 
-	var debugkey string
+	log.Println("Waiting for any OpenSSL calls...")
 
 	for {
 		select {
 		case <-tick:
-			var (
-				key     uint32
-				value   Out
-				entries = objs.ActiveReadArgsMap.Iterate()
-			)
-			values := make(map[uint32]Out)
+			var key uint32 = 2
+			var value Out
 
-			for entries.Next(&key, &value) {
-				values[key] = value
+			err = objs.SslDataMap.LookupAndDelete(key, &value)
+			if err != nil {
+				continue
 			}
 
-			if err := entries.Err(); err != nil {
-				log.Fatal("Iterator encountered an error:", err)
+			if value.Id == 0 {
+				continue
 			}
 
-			for k, v := range values {
-				if k == 0 {
-					debugkey = "KPROBE: count"
-				} else if k == 1 {
-					debugkey = "KRETPROBE: error"
-				} else if k == 2 {
-					debugkey = "KRETPROBE: read OK"
-				} else {
-					debugkey = "UNKNOWN"
-				}
-				log.Printf("[DEBUG %s]\nkey: %d \nvalue:\n - fd: %d\n - message:\n\"%s\"\n%s\n", debugkey, k, v.Fd, v.Data, SEP)
-			}
+			log.Printf("[DEBUG URETPROBE: OK]\nkey: %d \nvalue:\n - tid: %d\n - message:\n\"%s\"\n%s\n", 2, value.Id, value.Buf, SEP)
 		case <-stop:
 			log.Print("Received signal, exiting...")
 			return
