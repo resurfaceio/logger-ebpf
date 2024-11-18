@@ -26,16 +26,19 @@ Add required soft link:
 sudo ln -s /usr/bin/llvm-strip-14 /usr/bin/llvm-strip
 ```
 
-Export include variable:
-```bash
-export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu/
-```
-
 ## Running Locally
+
+### Set up environment
 
 ```bash
 cd $HOME
 git clone https://github.com/resurfaceio/logger-ebpf.git
 cd logger-ebpf
+make headers
+```
+
+### Compile and run!
+
+```bash
 make build run
 ```
