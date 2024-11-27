@@ -11,25 +11,40 @@
 
 
 // #define DEBUG_ENABLED 0
-#define MAX_BYTES 500
+#define MAX_BYTES 1024
 
 
 struct data_buf_t {
-    int id;
+    u32 id;
     const char* buf;
 } buf_stash;
 
-struct SSL_data_t {
-    int id;
-    char buf[MAX_BYTES];
-} data;
+struct data_t {
+    // u32 pid;
+    // u32 tid;
+    // u32 uid;
+    u32 id;
+    char data[MAX_BYTES];
+} to_transfer;
+
+const struct data_t *unused __attribute__((unused));
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);
-    __type(value, struct SSL_data_t);
-    __uint(max_entries, 10);
-} ssl_data_map SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 4096);
+} reads SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 4096);
+} writes SEC(".maps");
+
+// struct {
+//     __uint(type, BPF_MAP_TYPE_HASH);
+//     __type(key, __u32);
+//     __type(value, __u32);
+//     __uint(max_entries, 10);
+// } id_map SEC(".maps");
 
 
 SEC("uprobe/handshake")
@@ -81,14 +96,23 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
         byte_count = MAX_BYTES;
     }
 
-
-    int key = 2;
-    data.id = buf_stash.id;
-
-
-    bpf_probe_read_user(&data.buf, byte_count, buf_stash.buf);
+    // u32 xid = 1 << 31;
+    to_transfer.id = (u32) id;
     
-    bpf_map_update_elem(&ssl_data_map, &key, &data, BPF_ANY);
+    // to_transfer.pid = id >> 32;
+    // to_transfer.tid = (u32) id;
+    // to_transfer.uid = bpf_get_current_uid_gid();
+
+
+    bpf_probe_read_user(&to_transfer.data, byte_count, buf_stash.buf);
+
+    if (rw == 0) {
+        bpf_ringbuf_output(&reads, &to_transfer, MAX_BYTES, 0);
+    } else {
+        bpf_ringbuf_output(&writes, &to_transfer, MAX_BYTES, 0);
+    }
+
+    // bpf_map_update_elem(&id_map, &k, &xid, 0);
     
     return 0;
 }

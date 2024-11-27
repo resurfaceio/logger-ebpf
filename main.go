@@ -1,16 +1,17 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"os"
 	"os/signal"
-	"time"
 
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
-const MAX_BYTES int = 500
+// const MAX_BYTES int = 500
 const SEP string = "🗣️ 📢 🔥🔥🔥"
 
 func main() {
@@ -61,36 +62,78 @@ func main() {
 	}
 	defer retlinkw.Close()
 
-	tick := time.Tick(time.Second)
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
-	type Out struct {
-		Id  uint32
-		Buf [MAX_BYTES]byte
-	}
+	// var incoming loggerDataT
 
 	log.Println("Waiting for any OpenSSL calls...")
 
-	for {
-		select {
-		case <-tick:
-			var key uint32 = 2
-			var value Out
+	rr, err := ringbuf.NewReader(objs.Reads)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+	defer rr.Close()
 
-			err = objs.SslDataMap.LookupAndDelete(key, &value)
-			if err != nil {
-				continue
-			}
+	wr, err := ringbuf.NewReader(objs.Writes)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+	defer wr.Close()
 
-			if value.Id == 0 {
-				continue
-			}
+	go func() {
+		<-stop
 
-			log.Printf("[DEBUG URETPROBE: OK]\nkey: %d \nvalue:\n - tid: %d\n - message:\n\"%s\"\n%s\n", 2, value.Id, value.Buf, SEP)
-		case <-stop:
-			log.Print("Received signal, exiting...")
-			return
+		if err := rr.Close(); err != nil {
+			log.Fatalf("closing ringbuf reads reader: %s", err)
 		}
+
+		if err := wr.Close(); err != nil {
+			log.Fatalf("closing ringbuf writes reader: %s", err)
+		}
+	}()
+
+	for {
+		receivedr, err := rr.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				log.Println("Received signal, exiting..")
+				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
+		}
+
+		receivedw, err := rr.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				log.Println("Received signal, exiting..")
+				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
+		}
+
+		// var key, val uint32
+		// key = 1
+		// err = objs.IdMap.LookupAndDelete(&key, &val)
+		// if err != nil {
+		// 	log.Printf("map lookup: %s", err)
+		// 	continue
+		// }
+
+		// log.Println(val)
+
+		// log.Println(received.RawSample)
+		// log.Println(binary.LittleEndian.Uint32(received.RawSample[:4]))
+		log.Printf("SSL_READ: %s\n", string(receivedr.RawSample[4:]))
+		log.Printf("SSL_WRITE: %s\n", string(receivedw.RawSample[4:]))
+
+		// if err := binary.Read(bytes.NewBuffer(received.RawSample[128:]), binary.LittleEndian, &incoming); err != nil {
+		// 	log.Printf("parsing ringbuf event: %s", err)
+		// 	continue
+		// }
+
+		// log.Printf("[DEBUG URETPROBE: OK]\nkey: %d \nvalue:\n - tid: %d\n - message:\n\"%s\"\n%s\n", 2, incoming.Id, incoming.Data, SEP)
 	}
 }
