@@ -127,93 +127,99 @@ func main() {
 
 	ex, err := link.OpenExecutable("/lib/x86_64-linux-gnu/libssl.so.3")
 	if err != nil {
-		log.Fatal("Opening executable:", err)
+		log.Fatal("Opening OpenSSL executable:", err)
 	}
 
-	entrylinkr, err := ex.Uprobe("SSL_read", objs.EntrySsl, nil)
+	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
+
+	// SSL_read
+	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySsl, nil)
 	if err != nil {
 		log.Fatal("Attaching uprobe:", err)
 	}
-	defer entrylinkr.Close()
+	defer entryRead.Close()
 
-	entrylinkw, err := ex.Uprobe("SSL_write", objs.EntrySsl, nil)
+	exitRead, err := ex.Uretprobe("SSL_read", objs.RetSslRead, nil)
+	if err != nil {
+		log.Fatal("Attaching uretprobe:", err)
+	}
+	defer exitRead.Close()
+
+	// SSL_write
+	entryWrite, err := ex.Uprobe("SSL_write", objs.EntrySsl, nil)
 	if err != nil {
 		log.Fatal("Attaching uprobe:", err)
 	}
-	defer entrylinkw.Close()
+	defer entryWrite.Close()
 
-	retlinkr, err := ex.Uretprobe("SSL_read", objs.RetSslRead, nil)
+	exitWrite, err := ex.Uretprobe("SSL_write", objs.RetSslWrite, nil)
 	if err != nil {
-		log.Fatal("Attaching kretprobe:", err)
+		log.Fatal("Attaching uretprobe:", err)
 	}
-	defer retlinkr.Close()
+	defer exitWrite.Close()
 
-	retlinkw, err := ex.Uretprobe("SSL_write", objs.RetSslWrite, nil)
+	//---------------------------------------------------------
+
+	// Define structures to receive data
+
+	readsReader, err := ringbuf.NewReader(objs.Reads)
 	if err != nil {
-		log.Fatal("Attaching kretprobe:", err)
+		log.Fatalf("opening ringbuf reader: %s", err)
 	}
-	defer retlinkw.Close()
+	defer readsReader.Close()
+
+	writesReader, err := ringbuf.NewReader(objs.Writes)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+	defer writesReader.Close()
 
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
-	// var incoming loggerDataT
-
-	log.Println("Waiting for any OpenSSL calls...")
-
-	rr, err := ringbuf.NewReader(objs.Reads)
-	if err != nil {
-		log.Fatalf("opening ringbuf reader: %s", err)
-	}
-	defer rr.Close()
-
-	wr, err := ringbuf.NewReader(objs.Writes)
-	if err != nil {
-		log.Fatalf("opening ringbuf reader: %s", err)
-	}
-	defer wr.Close()
-
 	go func() {
 		<-stop
 
-		if err := rr.Close(); err != nil {
+		if err := readsReader.Close(); err != nil {
 			log.Fatalf("closing ringbuf reads reader: %s", err)
 		}
 
-		if err := wr.Close(); err != nil {
+		if err := writesReader.Close(); err != nil {
 			log.Fatalf("closing ringbuf writes reader: %s", err)
 		}
 	}()
 
+	//---------------------------------------------------------
+
+	log.Println("Waiting for any OpenSSL calls...")
+
 	for {
-		receivedr, err := rr.Read()
+		readsReceived, err := readsReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				log.Println("Received signal, exiting..")
 				return
 			}
-			log.Printf("reading from reader: %s", err)
+			log.Printf("reading from reads reader: %s", err)
 			continue
 		}
 
-		receivedw, err := rr.Read()
+		writesReceived, err := writesReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				log.Println("Received signal, exiting..")
 				return
 			}
-			log.Printf("reading from reader: %s", err)
+			log.Printf("reading from writes reader: %s", err)
 			continue
 		}
 
-		// log.Println(received.RawSample) // print all bytes
-		// log.Println(binary.LittleEndian.Uint32(received.RawSample[:4])) // decode id
 		log.Println(SEP, "NEW BATCH - SSL_READ", SEP)
 		if DEBUG {
-			log.Printf("SSL_READ [FULL RAW PAYLOAD]: % x", receivedr.RawSample)
-			log.Printf("SSL_READ [FULL ASCII PAYLOAD]: %s", receivedr.RawSample)
+			log.Printf("SSL_READ [FULL RAW PAYLOAD]: % x", readsReceived.RawSample)
+			log.Printf("SSL_READ [FULL ASCII PAYLOAD]: %s", readsReceived.RawSample)
 		}
-		for _, rFrame := range toFrames(receivedr.RawSample) {
+		for _, rFrame := range toFrames(readsReceived.RawSample) {
 			log.Println(SEP)
 			if DEBUG {
 				log.Printf("SSL_READ [RAW FRAME]: % x", rFrame._raw)
@@ -230,10 +236,10 @@ func main() {
 
 		log.Println(SEP, "NEW BATCH - SSL_WRITE", SEP)
 		if DEBUG {
-			log.Printf("SSL_WRITE [FULL RAW PAYLOAD]: % x", receivedw.RawSample)
-			log.Printf("SSL_WRITE [FULL ASCII PAYLOAD]: %s", receivedw.RawSample)
+			log.Printf("SSL_WRITE [FULL RAW PAYLOAD]: % x", writesReceived.RawSample)
+			log.Printf("SSL_WRITE [FULL ASCII PAYLOAD]: %s", writesReceived.RawSample)
 		}
-		for _, wFrame := range toFrames(receivedw.RawSample) {
+		for _, wFrame := range toFrames(writesReceived.RawSample) {
 			log.Println(SEP)
 			if DEBUG {
 				log.Printf("SSL_WRITE [RAW FRAME]: % x", string(wFrame._raw))
