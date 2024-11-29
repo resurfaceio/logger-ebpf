@@ -23,7 +23,7 @@ struct data_t {
     // u32 pid;
     // u32 tid;
     // u32 uid;
-    u32 id;
+    // u32 id;
     char data[MAX_BYTES];
 } to_transfer;
 
@@ -97,7 +97,7 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
     }
 
     // u32 xid = 1 << 31;
-    to_transfer.id = (u32) id;
+    // to_transfer.id = (u32) id;
     
     // to_transfer.pid = id >> 32;
     // to_transfer.tid = (u32) id;

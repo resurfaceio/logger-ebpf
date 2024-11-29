@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"log"
 	"os"
@@ -13,6 +14,97 @@ import (
 
 // const MAX_BYTES int = 500
 const SEP string = "🗣️ 📢 🔥🔥🔥"
+const DEBUG bool = true
+
+const (
+	DATA byte = iota
+	HEADERS
+	PRIORITY
+	RST_STREAM
+	SETTINGS
+	PUSH_PROMISE
+	PING
+	GOAWAY
+	WINDOW_UPDATE
+	CONTINUATION
+	ALTSVC
+	ORIGIN
+)
+
+type h2frame struct {
+	_len       [3]byte
+	_lend      uint32
+	_type      byte
+	_flag      byte
+	_streamID  [4]byte
+	_streamIDd uint32
+	_data      []byte
+	_empty     bool
+	_raw       []byte
+}
+
+func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
+	//log.Println("offset: ", offset)
+	if offset+3 > len(barray) {
+		nextIndex = -1
+		frame._empty = true
+		return
+	}
+	copy(frame._len[:], barray[offset:3+offset])
+
+	tmp := make([]byte, 4)
+	copy(tmp[1:], frame._len[:])
+	frame._lend = binary.BigEndian.Uint32(tmp)
+	//log.Println("lend: ", frame._lend)
+
+	nextIndex = 9 + offset + int(frame._lend)
+	if nextIndex >= len(barray) {
+		nextIndex = -1
+		frame._empty = true
+		return
+	}
+
+	frame._type = barray[3+offset]
+
+	if frame._type == SETTINGS {
+		// nothing
+	}
+
+	frame._flag = barray[4+offset]
+
+	copy(frame._streamID[:], barray[5+offset:9+offset])
+
+	copy(tmp[:], frame._streamID[:])
+	frame._streamIDd = binary.BigEndian.Uint32(tmp)
+
+	frame._empty = (frame._lend+uint32(frame._type)+uint32(frame._flag)+frame._streamIDd == 0)
+	if !frame._empty {
+		frame._data = make([]byte, frame._lend)
+		copy(frame._data, barray[9+offset:nextIndex])
+
+		frame._raw = make([]byte, nextIndex-offset)
+		copy(frame._raw, barray[offset:nextIndex])
+	}
+
+	return
+}
+
+func toFrames(frameBytes []byte) (frames []h2frame) {
+	var frame h2frame
+	var offset int = 0
+	// for {
+	for offset < len(frameBytes) {
+		frame, offset = toh2frame(frameBytes, offset)
+		if offset == -1 {
+			break
+		}
+		if !frame._empty {
+			frames = append(frames, frame)
+		}
+	}
+
+	return
+}
 
 func main() {
 	// Remove resource limits for kernels <5.11.
@@ -114,26 +206,48 @@ func main() {
 			continue
 		}
 
-		// var key, val uint32
-		// key = 1
-		// err = objs.IdMap.LookupAndDelete(&key, &val)
-		// if err != nil {
-		// 	log.Printf("map lookup: %s", err)
-		// 	continue
-		// }
+		// log.Println(received.RawSample) // print all bytes
+		// log.Println(binary.LittleEndian.Uint32(received.RawSample[:4])) // decode id
+		log.Println(SEP, "NEW BATCH - SSL_READ", SEP)
+		if DEBUG {
+			log.Printf("SSL_READ [FULL RAW PAYLOAD]: % x", receivedr.RawSample)
+			log.Printf("SSL_READ [FULL ASCII PAYLOAD]: %s", receivedr.RawSample)
+		}
+		for _, rFrame := range toFrames(receivedr.RawSample) {
+			log.Println(SEP)
+			if DEBUG {
+				log.Printf("SSL_READ [RAW FRAME]: % x", rFrame._raw)
+			}
+			log.Printf("SSL_READ [FRAME]:\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tData: % x\n",
+				rFrame._lend,
+				rFrame._len,
+				rFrame._type,
+				rFrame._flag,
+				rFrame._streamIDd,
+				rFrame._streamID,
+				rFrame._data)
+		}
 
-		// log.Println(val)
+		log.Println(SEP, "NEW BATCH - SSL_WRITE", SEP)
+		if DEBUG {
+			log.Printf("SSL_WRITE [FULL RAW PAYLOAD]: % x", receivedw.RawSample)
+			log.Printf("SSL_WRITE [FULL ASCII PAYLOAD]: %s", receivedw.RawSample)
+		}
+		for _, wFrame := range toFrames(receivedw.RawSample) {
+			log.Println(SEP)
+			if DEBUG {
+				log.Printf("SSL_WRITE [RAW FRAME]: % x", string(wFrame._raw))
+			}
+			log.Printf("SSL_WRITE [FRAME]:\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tData: % x\n",
+				wFrame._lend,
+				wFrame._len,
+				wFrame._type,
+				wFrame._flag,
+				wFrame._streamIDd,
+				wFrame._streamID,
+				wFrame._data)
 
-		// log.Println(received.RawSample)
-		// log.Println(binary.LittleEndian.Uint32(received.RawSample[:4]))
-		log.Printf("SSL_READ: %s\n", string(receivedr.RawSample[4:]))
-		log.Printf("SSL_WRITE: %s\n", string(receivedw.RawSample[4:]))
-
-		// if err := binary.Read(bytes.NewBuffer(received.RawSample[128:]), binary.LittleEndian, &incoming); err != nil {
-		// 	log.Printf("parsing ringbuf event: %s", err)
-		// 	continue
-		// }
-
-		// log.Printf("[DEBUG URETPROBE: OK]\nkey: %d \nvalue:\n - tid: %d\n - message:\n\"%s\"\n%s\n", 2, incoming.Id, incoming.Data, SEP)
+		}
+		log.Println(SEP)
 	}
 }
