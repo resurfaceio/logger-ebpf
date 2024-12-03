@@ -10,6 +10,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // const MAX_BYTES int = 500
@@ -58,7 +60,7 @@ func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 	//log.Println("lend: ", frame._lend)
 
 	nextIndex = 9 + offset + int(frame._lend)
-	if nextIndex >= len(barray) {
+	if nextIndex > len(barray) {
 		nextIndex = -1
 		frame._empty = true
 		return
@@ -107,6 +109,7 @@ func toFrames(frameBytes []byte) (frames []h2frame) {
 }
 
 func main() {
+
 	// Remove resource limits for kernels <5.11.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("Removing memlock:", err)
@@ -133,7 +136,7 @@ func main() {
 	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
 
 	// SSL_read
-	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySsl, nil)
+	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySslRead, nil)
 	if err != nil {
 		log.Fatal("Attaching uprobe:", err)
 	}
@@ -146,7 +149,7 @@ func main() {
 	defer exitRead.Close()
 
 	// SSL_write
-	entryWrite, err := ex.Uprobe("SSL_write", objs.EntrySsl, nil)
+	entryWrite, err := ex.Uprobe("SSL_write", objs.EntrySslWrite, nil)
 	if err != nil {
 		log.Fatal("Attaching uprobe:", err)
 	}
@@ -174,86 +177,109 @@ func main() {
 	}
 	defer writesReader.Close()
 
+	readers := map[string]*ringbuf.Reader{"READ": readsReader, "WRITE": writesReader}
+	rw := make([]string, 0, len(readers))
+	for k := range readers {
+		rw = append(rw, k)
+	}
+
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
 
 	go func() {
 		<-stop
 
-		if err := readsReader.Close(); err != nil {
-			log.Fatalf("closing ringbuf reads reader: %s", err)
-		}
-
-		if err := writesReader.Close(); err != nil {
-			log.Fatalf("closing ringbuf writes reader: %s", err)
+		for rtype, reader := range readers {
+			if err := reader.Close(); err != nil {
+				log.Fatalf("closing ringbuf \"%s\" reader: %s", rtype, err)
+			}
 		}
 	}()
 
 	//---------------------------------------------------------
 
+	// var received [2]ringbuf.Record
+
+	// isHttp2 := false
+	isClient := len(os.Args) > 1 && os.Args[1] == "client"
+
+	if isClient {
+		rw[0], rw[1] = rw[1], rw[0]
+		log.Println("Logger enabled in CLIENT mode")
+	}
+
 	log.Println("Waiting for any OpenSSL calls...")
 
 	for {
-		readsReceived, err := readsReader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("Received signal, exiting..")
-				return
-			}
-			log.Printf("reading from reads reader: %s", err)
-			continue
-		}
+		for _, key := range rw {
+			// for i, key := range rw {
+			reader := readers[key]
 
-		writesReceived, err := writesReader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("Received signal, exiting..")
-				return
+			received, err := reader.Read()
+			// record, err := reader.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					log.Println("Received signal, exiting..")
+					return
+				}
+				log.Printf("reading from %s reader: %s", key, err)
+				continue
 			}
-			log.Printf("reading from writes reader: %s", err)
-			continue
-		}
+			// received[i] = record
 
-		log.Println(SEP, "NEW BATCH - SSL_READ", SEP)
-		if DEBUG {
-			log.Printf("SSL_READ [FULL RAW PAYLOAD]: % x", readsReceived.RawSample)
-			log.Printf("SSL_READ [FULL ASCII PAYLOAD]: %s", readsReceived.RawSample)
-		}
-		for _, rFrame := range toFrames(readsReceived.RawSample) {
-			log.Println(SEP)
+			var raw []byte
+
+			if len(received.RawSample) >= 24 && string(received.RawSample[:24]) == http2.ClientPreface {
+				raw = received.RawSample[24:]
+				log.Println("RECEIVED HTTP2 MESSAGE")
+			} else {
+				raw = received.RawSample
+				// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
+				// continue
+			}
+
+			log.Printf("%sNEW BATCH - SSL_%s %s", "", key, SEP)
 			if DEBUG {
-				log.Printf("SSL_READ [RAW FRAME]: % x", rFrame._raw)
+				log.Printf("SSL_%s [FULL RAW PAYLOAD]: % x", key, received.RawSample)
+				// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
 			}
-			log.Printf("SSL_READ [FRAME]:\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tData: % x\n",
-				rFrame._lend,
-				rFrame._len,
-				rFrame._type,
-				rFrame._flag,
-				rFrame._streamIDd,
-				rFrame._streamID,
-				rFrame._data)
-		}
 
-		log.Println(SEP, "NEW BATCH - SSL_WRITE", SEP)
-		if DEBUG {
-			log.Printf("SSL_WRITE [FULL RAW PAYLOAD]: % x", writesReceived.RawSample)
-			log.Printf("SSL_WRITE [FULL ASCII PAYLOAD]: %s", writesReceived.RawSample)
-		}
-		for _, wFrame := range toFrames(writesReceived.RawSample) {
-			log.Println(SEP)
-			if DEBUG {
-				log.Printf("SSL_WRITE [RAW FRAME]: % x", string(wFrame._raw))
+			for _, frame := range toFrames(raw) {
+				if DEBUG {
+					log.Printf("SSL_%s [RAW FRAME]: % x", key, frame._raw)
+					log.Printf("SSL_%s [FRAME]\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+						key,
+						frame._lend,
+						frame._len,
+						frame._type,
+						frame._flag,
+						frame._streamIDd,
+						frame._streamID,
+						frame._data,
+					)
+				}
+
+				if frame._type == DATA {
+					log.Printf("DATA: %s\n", frame._data)
+				}
+
+				if frame._type == HEADERS {
+					decoder := hpack.NewDecoder(2048, nil)
+					headers, err := decoder.DecodeFull(frame._data)
+					if err != nil {
+						log.Println("decoding headers: ", err)
+						continue
+					}
+					log.Println("HEADERS:")
+					for _, header := range headers {
+						log.Printf("\t%s\n", header.Name+":"+header.Value)
+					}
+				}
+
+				if DEBUG {
+					log.Println(SEP)
+				}
 			}
-			log.Printf("SSL_WRITE [FRAME]:\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tData: % x\n",
-				wFrame._lend,
-				wFrame._len,
-				wFrame._type,
-				wFrame._flag,
-				wFrame._streamIDd,
-				wFrame._streamID,
-				wFrame._data)
-
 		}
-		log.Println(SEP)
 	}
 }
