@@ -13,21 +13,28 @@
 // #define DEBUG_ENABLED 0
 #define MAX_BYTES 1024
 
+// Data buffers
 
 struct data_buf_t {
     u32 id;
     const char* buf;
-} buf_stash;
+};
 
-struct data_t {
-    // u32 pid;
-    // u32 tid;
-    // u32 uid;
-    // u32 id;
-    char data[MAX_BYTES];
-} to_transfer;
+// struct data_t {
+//     // u32 pid;
+//     // u32 tid;
+//     // u32 uid;
+//     // u32 id;
+//     char data[MAX_BYTES];
+// } to_transfer;
 
-const struct data_t *unused __attribute__((unused));
+char rdata[MAX_BYTES], wdata[MAX_BYTES];
+
+// const struct data_t *unused __attribute__((unused));
+
+struct data_buf_t reads_stash, writes_stash;
+
+// eBPF maps
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -47,12 +54,17 @@ struct {
 // } id_map SEC(".maps");
 
 
-SEC("uprobe/handshake")
-int BPF_UPROBE(entry_ssl, void* ssl, void *buf, int num) {
-    int id = bpf_get_current_pid_tgid();
+// Main functions
 
-    buf_stash.id = id;
-    buf_stash.buf = buf;
+static int SSL_entry(void *buf, int rw) {
+    // int id = bpf_get_current_pid_tgid();
+    // buf_stash.id = id;
+
+    if (rw == 0) {
+        reads_stash.buf = buf;
+    } else {
+        writes_stash.buf = buf;
+    }
 
     //---------------------
     /*
@@ -68,27 +80,10 @@ int BPF_UPROBE(entry_ssl, void* ssl, void *buf, int num) {
 
 
 static int SSL_exit(struct pt_regs *ctx, int rw) {
-    int id = bpf_get_current_pid_tgid();
-
-    int k = 1;
-    if (buf_stash.buf == NULL) {
-        /*
-        if (DEBUG_ENABLED) {
-            struct data_t v = { read_args.fd, "failed: buf is NULL" };
-            bpf_map_update_elem(&active_read_args_map, &k, &v, BPF_ANY);
-        }
-        */
-        return 1;
-    }
+    // int id = bpf_get_current_pid_tgid();
 
     int byte_count = PT_REGS_RC(ctx);
     if (byte_count <= 0) {
-        /*
-        if (DEBUG_ENABLED) {
-            struct data_t v = { read_args.fd, "failed: bytes_read <= 0" };
-            bpf_map_update_elem(&active_read_args_map, &k, &v, BPF_ANY);
-        }
-        */
         return 2;
     }
 
@@ -96,25 +91,29 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
         byte_count = MAX_BYTES;
     }
 
-    // u32 xid = 1 << 31;
-    // to_transfer.id = (u32) id;
     
-    // to_transfer.pid = id >> 32;
-    // to_transfer.tid = (u32) id;
-    // to_transfer.uid = bpf_get_current_uid_gid();
-
-
-    bpf_probe_read_user(&to_transfer.data, byte_count, buf_stash.buf);
-
     if (rw == 0) {
-        bpf_ringbuf_output(&reads, &to_transfer, MAX_BYTES, 0);
+        bpf_probe_read_user(&rdata, byte_count, reads_stash.buf);
+        bpf_ringbuf_output(&reads, &rdata, byte_count, 0);
     } else {
-        bpf_ringbuf_output(&writes, &to_transfer, MAX_BYTES, 0);
+        bpf_probe_read_user(&wdata, byte_count, writes_stash.buf);
+        bpf_ringbuf_output(&writes, &wdata, byte_count, 0);
     }
 
-    // bpf_map_update_elem(&id_map, &k, &xid, 0);
     
     return 0;
+}
+
+// Hooks
+
+SEC("uprobe/SSL_read")
+int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
+    return (SSL_entry(buf, 0));
+}
+
+SEC("uprobe/SSL_write")
+int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
+    return (SSL_entry(buf, 1));
 }
 
 SEC("uretprobe/SSL_read")
