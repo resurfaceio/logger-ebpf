@@ -39,9 +39,7 @@ const (
 )
 
 type parsedMessage struct {
-	req      string
 	httpReq  http.Request
-	resp     string
 	httpResp http.Response
 	isHttp2  bool
 }
@@ -402,8 +400,8 @@ func parse(message *rawMessage) *parsedMessage {
 		}
 
 		// Request headers
-		headers := parseHeaders(req[1], nil)
-		host := headers.Get("Host")
+		reqHeaders := parseHeaders(req[1], nil)
+		host := reqHeaders.Get("Host")
 
 		// Response
 		firstLine = bytes.Fields(resp[0])
@@ -418,12 +416,12 @@ func parse(message *rawMessage) *parsedMessage {
 		}
 
 		// Response headers
-		headers = parseHeaders(resp[1], nil)
+		respHeaders := parseHeaders(resp[1], nil)
 
 		// Trailers
-		if len(resp[2]) != 0 && headers.Get("Transfer-Encoding") == "chunked" && headers.Get("Trailer") != "" {
+		if len(resp[2]) != 0 && respHeaders.Get("Transfer-Encoding") == "chunked" && respHeaders.Get("Trailer") != "" {
 			lastChunkIndex := bytes.LastIndex(resp[2], append([]byte("0"), crlf...)) + 3
-			headers = parseHeaders(resp[2][lastChunkIndex:], headers)
+			respHeaders = parseHeaders(resp[2][lastChunkIndex:], respHeaders)
 			resp[2] = resp[2][:lastChunkIndex]
 		}
 
@@ -432,12 +430,12 @@ func parse(message *rawMessage) *parsedMessage {
 			log.Printf("[PARSE] Response body: % x\n", resp[2])
 		}
 
-		// Wraping it up
+		// Wrap it up
 		parsed.httpReq = http.Request{
 			Method: method,
 			Host:   host,
 			URL:    parsedUrl,
-			Header: headers,
+			Header: reqHeaders,
 			Body:   io.NopCloser(bytes.NewReader(req[2])),
 		}
 
@@ -447,120 +445,117 @@ func parse(message *rawMessage) *parsedMessage {
 
 		parsed.httpResp = http.Response{
 			StatusCode: status,
-			Header:     headers,
+			Header:     respHeaders,
 			Body:       io.NopCloser(bytes.NewReader(resp[2])),
 		}
 
-		parsed.req = string(message.rawReq)
-		parsed.resp = string(message.rawResp)
 	} else {
-		var req, resp string
+		var method, host string
+		var status int
+		var reqBody, respBody []byte
+		parsedUrl := &url.URL{}
+		reqHeaders := http.Header{}
+		respHeaders := http.Header{}
 
-		for _, frame := range toFrames(message.rawReq) {
-			if DEBUG {
-				log.Printf("[PARSE] REQ - RAW FRAME: % x", frame._raw)
-				log.Printf("[PARSE] REQ - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
-					frame._lend,
-					frame._len,
-					frame._type,
-					frame._flag,
-					frame._streamIDd,
-					frame._streamID,
-					frame._data,
-				)
+		for i, raw := range [][]byte{message.rawReq, message.rawResp} {
+			label := "REQ"
+			if i != 0 {
+				label = "RESP"
 			}
-
-			if frame._type == HEADERS {
-				decoder := hpack.NewDecoder(2048, nil)
-				headers, err := decoder.DecodeFull(frame._data)
-				if err != nil {
-					log.Println("decoding headers: ", err)
-					continue
-				}
-
+			for _, frame := range toFrames(raw) {
 				if DEBUG {
-					log.Println("[PARSE] REQ - HEADERS")
+					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
+					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+						label,
+						frame._lend,
+						frame._len,
+						frame._type,
+						frame._flag,
+						frame._streamIDd,
+						frame._streamID,
+						frame._data,
+					)
 				}
 
-				for _, header := range headers {
-					joined := header.Name + ":" + header.Value + "\r\n"
-					req += joined
+				if frame._type == HEADERS {
+					decoder := hpack.NewDecoder(2048, nil)
+					headers, err := decoder.DecodeFull(frame._data)
+					if err != nil {
+						log.Println("decoding headers: ", err)
+						continue
+					}
+
 					if DEBUG {
-						log.Println(joined)
+						log.Printf("[PARSE] %s - HEADERS\n", label)
+					}
+
+					for _, header := range headers {
+						switch header.Name {
+						case ":method":
+							method = header.Value
+						case ":scheme":
+							parsedUrl.Scheme = header.Value
+						case ":authority":
+							host = header.Value
+							parsedUrl.Host = header.Value
+						case ":path":
+							parsedUrl.Path = header.Value
+						case ":status":
+							status, err = strconv.Atoi(header.Value)
+							if err != nil {
+								if DEBUG {
+									log.Println("parsing url: ", err)
+								}
+								return nil
+							}
+						default:
+							if i == 0 {
+								reqHeaders.Add(header.Name, header.Value)
+							} else {
+								respHeaders.Add(header.Name, header.Value)
+							}
+						}
+						if DEBUG {
+							log.Println(header.Name + ":" + header.Value)
+						}
 					}
 				}
-			}
 
-			if frame._type == DATA {
-				req += string(frame._data)
+				if frame._type == DATA {
+					if i == 0 {
+						reqBody = append(reqBody, frame._data...)
+					} else {
+						respBody = append(respBody, frame._data...)
+					}
+
+					if DEBUG {
+						log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
+					}
+				}
+
 				if DEBUG {
-					log.Printf("[PARSE] REQ - DATA: %s\n", frame._data)
+					log.Println(SEP)
 				}
 			}
 
-			if DEBUG {
-				log.Println(SEP)
+			// Wrap it up
+			parsed.httpReq = http.Request{
+				Method:        method,
+				Host:          host,
+				URL:           parsedUrl,
+				Header:        reqHeaders,
+				Body:          io.NopCloser(bytes.NewReader(reqBody)),
+				ContentLength: int64(len(reqBody)),
+			}
+
+			parsed.httpResp = http.Response{
+				StatusCode:    status,
+				Header:        respHeaders,
+				Body:          io.NopCloser(bytes.NewReader(respBody)),
+				ContentLength: int64(len(respBody)),
 			}
 		}
 
-		parsed.req = req
-
-		for _, frame := range toFrames(message.rawResp) {
-			if DEBUG {
-				log.Printf("[PARSE] RES - RAW FRAME: % x", frame._raw)
-				log.Printf("[PARSE] RES - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
-					frame._lend,
-					frame._len,
-					frame._type,
-					frame._flag,
-					frame._streamIDd,
-					frame._streamID,
-					frame._data,
-				)
-			}
-
-			if frame._type == HEADERS {
-				decoder := hpack.NewDecoder(2048, nil)
-				headers, err := decoder.DecodeFull(frame._data)
-				if err != nil {
-					log.Println("decoding headers: ", err)
-					continue
-				}
-
-				if DEBUG {
-					log.Println("[PARSE] RES - HEADERS")
-				}
-
-				for _, header := range headers {
-					joined := header.Name + ":" + header.Value + "\r\n"
-					resp += joined
-					if DEBUG {
-						log.Println(joined)
-					}
-				}
-			}
-
-			if frame._type == DATA {
-				resp += string(frame._data)
-				if DEBUG {
-					log.Printf("[PARSE] RES - DATA: %s\n", frame._data)
-				}
-			}
-
-			if DEBUG {
-				log.Println(SEP)
-			}
-		}
-
-		parsed.resp = resp
-	}
-
-	if DEBUG {
-		log.Printf("[PARSE] Parsed Message info <len(req), len(resp)>: %d, %d\n", len(parsed.req), len(parsed.resp))
-	}
-
-	if len(parsed.req) == 0 || len(parsed.resp) == 0 {
-		return nil
 	}
 
 	return parsed
@@ -570,36 +565,22 @@ func process() {
 	for {
 		message := <-mc
 		if message != nil {
-			if !message.isHttp2 {
-				log.Println("Message is HTTP1")
-
-				log.Println(message.httpReq)
-				body, err := io.ReadAll(message.httpReq.Body)
-				if err == nil {
-					bodys := "-"
-					if len(body) != 0 {
-						bodys = string(body)
-					}
-					log.Println("Request body: ", bodys)
-					message.httpReq.Body.Close()
-				}
-
-				log.Println(message.httpResp)
-				body, err = io.ReadAll(message.httpResp.Body)
-				if err == nil {
-					bodys := "-"
-					if len(body) != 0 {
-						bodys = string(body)
-					}
-					log.Println("Response body: ", bodys)
-					message.httpResp.Body.Close()
-				}
-			} else {
-				log.Println("Message is HTTP2")
-				log.Printf("REQUEST %s\n%s\n", SEP, message.req)
-				log.Printf("RESPONSE %s\n%s\n", SEP, message.resp)
-			}
 			log.Println(SEP)
+			log.Println("Request: ", message.httpReq)
+			log.Println("Response: ", message.httpResp)
+			log.Printf("Message is HTTP2: %v\n", message.isHttp2)
+
+			body, err := io.ReadAll(message.httpReq.Body)
+			if err == nil {
+				log.Printf("Request body %v:\n%s\n", message.httpReq.Body, body)
+				message.httpReq.Body.Close()
+			}
+
+			body, err = io.ReadAll(message.httpResp.Body)
+			if err == nil {
+				log.Printf("Response body %v:\n%s\n", message.httpResp.Body, body)
+				message.httpResp.Body.Close()
+			}
 		}
 	}
 }
