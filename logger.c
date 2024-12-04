@@ -20,15 +20,16 @@ struct data_buf_t {
     const char* buf;
 };
 
-// struct data_t {
-//     // u32 pid;
-//     // u32 tid;
-//     // u32 uid;
-//     // u32 id;
-//     char data[MAX_BYTES];
-// } to_transfer;
+struct data_t {
+    // u32 pid;
+    // u32 tid;
+    // u32 uid;
+    u32 id;
+    char data[MAX_BYTES];
+};
 
-char rdata[MAX_BYTES], wdata[MAX_BYTES];
+// char rdata[MAX_BYTES], wdata[MAX_BYTES];
+struct data_t rdata, wdata;
 
 // const struct data_t *unused __attribute__((unused));
 
@@ -80,7 +81,10 @@ static int SSL_entry(void *buf, int rw) {
 
 
 static int SSL_exit(struct pt_regs *ctx, int rw) {
-    // int id = bpf_get_current_pid_tgid();
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = (u32) id;
+    u32 tgid = id >> 32;
+    // u32 id = (255) + (255 << 8) + (255 << 16) + (255 << 24);  // max u32 = 4294967295
 
     int byte_count = PT_REGS_RC(ctx);
     if (byte_count <= 0) {
@@ -93,11 +97,13 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
 
     
     if (rw == 0) {
-        bpf_probe_read_user(&rdata, byte_count, reads_stash.buf);
-        bpf_ringbuf_output(&reads, &rdata, byte_count, 0);
+        rdata.id = tgid;
+        bpf_probe_read_user(&rdata.data, byte_count, reads_stash.buf);
+        bpf_ringbuf_output(&reads, &rdata, byte_count + sizeof(u32), 0);
     } else {
-        bpf_probe_read_user(&wdata, byte_count, writes_stash.buf);
-        bpf_ringbuf_output(&writes, &wdata, byte_count, 0);
+        wdata.id = tgid;
+        bpf_probe_read_user(&wdata.data, byte_count, writes_stash.buf);
+        bpf_ringbuf_output(&writes, &wdata, byte_count + sizeof(u32), 0);
     }
 
     

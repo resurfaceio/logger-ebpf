@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -32,6 +33,19 @@ const (
 	ORIGIN
 )
 
+type parsedMessage struct {
+	req string
+	res string
+}
+
+type rawMessage struct {
+	rawReq    []byte
+	rawRes    []byte
+	createdAt time.Time
+	isHttp2   bool
+	isClosed  bool
+}
+
 type h2frame struct {
 	_len       [3]byte
 	_lend      uint32
@@ -43,6 +57,9 @@ type h2frame struct {
 	_empty     bool
 	_raw       []byte
 }
+
+var messages map[uint32]*rawMessage
+var mc chan *parsedMessage
 
 func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 	//log.Println("offset: ", offset)
@@ -179,11 +196,13 @@ func main() {
 
 	r := make(chan ringbuf.Record)
 	w := make(chan ringbuf.Record)
+	messages = make(map[uint32]*rawMessage)
+	mc = make(chan *parsedMessage)
 
 	go func() {
+		var received ringbuf.Record
 		for {
-			received, err := readsReader.Read()
-			if err != nil {
+			if err := readsReader.ReadInto(&received); err != nil {
 				if errors.Is(err, ringbuf.ErrClosed) {
 					log.Println("closing reads channel...")
 					close(r)
@@ -197,9 +216,9 @@ func main() {
 	}()
 
 	go func() {
+		var received ringbuf.Record
 		for {
-			received, err := writesReader.Read()
-			if err != nil {
+			if err := writesReader.ReadInto(&received); err != nil {
 				if errors.Is(err, ringbuf.ErrClosed) {
 					log.Println("closing writes channel...")
 					close(w)
@@ -216,6 +235,10 @@ func main() {
 	signal.Notify(stop, os.Interrupt)
 
 	//---------------------------------------------------------
+
+	isClient := len(os.Args) > 1 && os.Args[1] == "client"
+
+	go process()
 
 	log.Println("Waiting for any OpenSSL calls...")
 
@@ -240,65 +263,259 @@ func main() {
 			return
 
 		case record := <-r:
-			printRecord(record, "READ")
+			ingest(record, !isClient)
 		case record := <-w:
-			printRecord(record, "WRITE")
+			ingest(record, isClient)
+		default:
+			for id, message := range messages {
+				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawRes) != 0 {
+					message.isClosed = true
+					if DEBUG {
+						log.Printf("[MAIN] Message %d closed for ingestion", id)
+						log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
+						log.Printf("[MAIN] Raw Response: [% x]\n", message.rawRes)
+					}
+					mc <- parse(message)
+				}
+			}
+			// time.Sleep(2 * time.Second)
 		}
 	}
 }
 
-func printRecord(rec ringbuf.Record, key string) {
-	var raw []byte
-
-	if len(rec.RawSample) >= 24 && string(rec.RawSample[:24]) == http2.ClientPreface {
-		raw = rec.RawSample[24:]
-		log.Println("RECEIVED HTTP2 MESSAGE")
-	} else {
-		raw = rec.RawSample
-		// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
-		// continue
+func ingest(rec ringbuf.Record, isReq bool) {
+	if len(rec.RawSample) < 4 {
+		return
 	}
+	id := binary.LittleEndian.Uint32(rec.RawSample[:4])
+	raw := rec.RawSample[4:]
 
-	log.Printf("%sNEW BATCH - SSL_%s %s", "", key, SEP)
 	if DEBUG {
-		log.Printf("SSL_%s [FULL RAW PAYLOAD]: % x", key, rec.RawSample)
-		// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
+		t := "RES"
+		if isReq {
+			t = "REQ"
+		}
+		log.Printf("[INGEST] TGID - %s: %d\n", t, id)
+		log.Printf("[INGEST] RAW - %s: % x\n", t, raw)
 	}
 
-	for _, frame := range toFrames(raw) {
-		if DEBUG {
-			log.Printf("SSL_%s [RAW FRAME]: % x", key, frame._raw)
-			log.Printf("SSL_%s [FRAME]\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
-				key,
-				frame._lend,
-				frame._len,
-				frame._type,
-				frame._flag,
-				frame._streamIDd,
-				frame._streamID,
-				frame._data,
-			)
-		}
+	if message, exists := messages[id]; !exists {
+		m := new(rawMessage)
+		m.createdAt = time.Now()
 
-		if frame._type == DATA {
-			log.Printf("DATA: %s\n", frame._data)
-		}
-
-		if frame._type == HEADERS {
-			decoder := hpack.NewDecoder(2048, nil)
-			headers, err := decoder.DecodeFull(frame._data)
-			if err != nil {
-				log.Println("decoding headers: ", err)
-				continue
-			}
-			log.Println("HEADERS:")
-			for _, header := range headers {
-				log.Printf("\t%s\n", header.Name+":"+header.Value)
+		if isReq {
+			m.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
+			if m.isHttp2 {
+				raw = raw[24:]
 			}
 		}
+		messages[id] = m
+	} else {
+		if message.isClosed {
+			return
+		}
+		if len(message.rawReq) == 0 && isReq {
+			messages[id].isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
+			if messages[id].isHttp2 {
+				raw = raw[24:]
+			}
+		}
+	}
 
-		if DEBUG {
+	message := messages[id]
+
+	if isReq {
+		message.rawReq = append(message.rawReq, raw...)
+	} else {
+		message.rawRes = append(message.rawRes, raw...)
+	}
+
+}
+
+func parse(message *rawMessage) *parsedMessage {
+	parsed := new(parsedMessage)
+
+	if DEBUG {
+		log.Printf("[PARSE] Raw Message info <len(req), len(res), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawRes), message.isHttp2)
+	}
+
+	if !message.isHttp2 {
+		parsed.req = string(message.rawReq)
+		parsed.res = string(message.rawRes)
+	} else {
+		var req, res string
+
+		for _, frame := range toFrames(message.rawReq) {
+			if DEBUG {
+				log.Printf("[PARSE] REQ - RAW FRAME: % x", frame._raw)
+				log.Printf("[PARSE] REQ - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+					frame._lend,
+					frame._len,
+					frame._type,
+					frame._flag,
+					frame._streamIDd,
+					frame._streamID,
+					frame._data,
+				)
+			}
+
+			if frame._type == HEADERS {
+				decoder := hpack.NewDecoder(2048, nil)
+				headers, err := decoder.DecodeFull(frame._data)
+				if err != nil {
+					log.Println("decoding headers: ", err)
+					continue
+				}
+
+				if DEBUG {
+					log.Println("[PARSE] REQ - HEADERS")
+				}
+
+				for _, header := range headers {
+					joined := header.Name + ":" + header.Value + "\r\n"
+					req += joined
+					if DEBUG {
+						log.Println(joined)
+					}
+				}
+			}
+
+			if frame._type == DATA {
+				req += string(frame._data)
+				if DEBUG {
+					log.Printf("[PARSE] REQ - DATA: %s\n", frame._data)
+				}
+			}
+
+			if DEBUG {
+				log.Println(SEP)
+			}
+		}
+
+		parsed.req = req
+
+		for _, frame := range toFrames(message.rawRes) {
+			if DEBUG {
+				log.Printf("[PARSE] RES - RAW FRAME: % x", frame._raw)
+				log.Printf("[PARSE] RES - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+					frame._lend,
+					frame._len,
+					frame._type,
+					frame._flag,
+					frame._streamIDd,
+					frame._streamID,
+					frame._data,
+				)
+			}
+
+			if frame._type == HEADERS {
+				decoder := hpack.NewDecoder(2048, nil)
+				headers, err := decoder.DecodeFull(frame._data)
+				if err != nil {
+					log.Println("decoding headers: ", err)
+					continue
+				}
+
+				if DEBUG {
+					log.Println("[PARSE] RES - HEADERS")
+				}
+
+				for _, header := range headers {
+					joined := header.Name + ":" + header.Value + "\r\n"
+					res += joined
+					if DEBUG {
+						log.Println(joined)
+					}
+				}
+			}
+
+			if frame._type == DATA {
+				res += string(frame._data)
+				if DEBUG {
+					log.Printf("[PARSE] RES - DATA: %s\n", frame._data)
+				}
+			}
+
+			if DEBUG {
+				log.Println(SEP)
+			}
+		}
+
+		parsed.res = res
+	}
+
+	if DEBUG {
+		log.Printf("[PARSE] Parsed Message info <len(req), len(res)>: %d, %d\n", len(parsed.req), len(parsed.res))
+	}
+
+	if len(parsed.req) == 0 || len(parsed.res) == 0 {
+		return nil
+	}
+
+	return parsed
+}
+
+func process() {
+	for {
+		message := <-mc
+		if message != nil {
+			log.Printf("REQUEST %s\n%s\n", SEP, message.req)
+			log.Printf("RESPONSE %s\n%s\n", SEP, message.res)
 			log.Println(SEP)
 		}
 	}
 }
+
+// func printRecord(raw []byte, key string) {
+// 	if len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface {
+// 		raw = raw[24:]
+// 		log.Println("RECEIVED HTTP2 MESSAGE")
+// 	} else {
+// 		// raw = rec.RawSample
+// 		// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
+// 		// continue
+// 	}
+
+// 	log.Printf("%sNEW BATCH - SSL_%s %s", "", key, SEP)
+// 	if DEBUG {
+// 		log.Printf("SSL_%s [FULL RAW PAYLOAD]: % x", key, rec.RawSample[4:])
+// 		// log.Printf("SSL_%s [FULL ASCII PAYLOAD]: %s", key, received.RawSample)
+// 	}
+
+// 	for _, frame := range toFrames(raw) {
+// 		if DEBUG {
+// 			log.Printf("SSL_%s [RAW FRAME]: % x", key, frame._raw)
+// 			log.Printf("SSL_%s [FRAME]\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+// 				key,
+// 				frame._lend,
+// 				frame._len,
+// 				frame._type,
+// 				frame._flag,
+// 				frame._streamIDd,
+// 				frame._streamID,
+// 				frame._data,
+// 			)
+// 		}
+
+// 		if frame._type == DATA {
+// 			log.Printf("DATA: %s\n", frame._data)
+// 		}
+
+// 		if frame._type == HEADERS {
+// 			decoder := hpack.NewDecoder(2048, nil)
+// 			headers, err := decoder.DecodeFull(frame._data)
+// 			if err != nil {
+// 				log.Println("decoding headers: ", err)
+// 				continue
+// 			}
+// 			log.Println("HEADERS:")
+// 			for _, header := range headers {
+// 				log.Printf("\t%s\n", header.Name+":"+header.Value)
+// 			}
+// 		}
+
+// 		if DEBUG {
+// 			log.Println(SEP)
+// 		}
+// 	}
+// }
