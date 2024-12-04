@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
 	"github.com/cilium/ebpf/link"
@@ -34,13 +39,16 @@ const (
 )
 
 type parsedMessage struct {
-	req string
-	res string
+	req      string
+	httpReq  http.Request
+	resp     string
+	httpResp http.Response
+	isHttp2  bool
 }
 
 type rawMessage struct {
 	rawReq    []byte
-	rawRes    []byte
+	rawResp   []byte
 	createdAt time.Time
 	isHttp2   bool
 	isClosed  bool
@@ -57,6 +65,8 @@ type h2frame struct {
 	_empty     bool
 	_raw       []byte
 }
+
+var crlf []byte = []byte("\r\n")
 
 var messages map[uint32]*rawMessage
 var mc chan *parsedMessage
@@ -241,12 +251,12 @@ func main() {
 			ingest(record, isClient)
 		default:
 			for id, message := range messages {
-				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawRes) != 0 {
+				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
 					message.isClosed = true
 					if DEBUG {
 						log.Printf("[MAIN] Message %d closed for ingestion", id)
 						log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-						log.Printf("[MAIN] Raw Response: [% x]\n", message.rawRes)
+						log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
 					}
 					mc <- parse(message)
 				}
@@ -332,23 +342,119 @@ func ingest(rec ringbuf.Record, isReq bool) {
 	if isReq {
 		message.rawReq = append(message.rawReq, raw...)
 	} else {
-		message.rawRes = append(message.rawRes, raw...)
+		message.rawResp = append(message.rawResp, raw...)
 	}
 
 }
 
+func parseHeaders(toParse []byte, existingHeaders http.Header) (headers http.Header) {
+	if existingHeaders != nil {
+		headers = http.Header.Clone(existingHeaders)
+	} else {
+		headers = http.Header{}
+	}
+	for _, line := range bytes.Split(toParse, crlf) {
+		header := bytes.Split(line, []byte(": "))
+		if len(header) < 2 {
+			continue
+		}
+		headers.Add(string(header[0]), string(header[1]))
+	}
+	return
+}
+
 func parse(message *rawMessage) *parsedMessage {
 	parsed := new(parsedMessage)
+	parsed.isHttp2 = message.isHttp2
 
 	if DEBUG {
-		log.Printf("[PARSE] Raw Message info <len(req), len(res), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawRes), message.isHttp2)
+		log.Printf("[PARSE] Raw Message info <len(req), len(resp), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawResp), message.isHttp2)
 	}
 
 	if !message.isHttp2 {
+		var req [3][]byte
+		var resp [3][]byte
+
+		// Slice first line, headers, body+trailers
+		copy(req[:2], bytes.SplitN(message.rawReq, crlf, 2))
+		copy(resp[:2], bytes.SplitN(message.rawResp, crlf, 2))
+
+		copy(req[1:], bytes.SplitN(req[1], append(crlf, crlf...), 2))
+		copy(resp[1:], bytes.SplitN(resp[1], append(crlf, crlf...), 2))
+
+		// Request
+		firstLine := bytes.Fields(req[0])
+
+		// Method
+		method := string(firstLine[0])
+
+		// URL
+		path := firstLine[1]
+		if !bytes.Contains(path, []byte("://")) && !bytes.HasPrefix(path, []byte("/")) {
+			path = append([]byte("/"), path...)
+		}
+		parsedUrl, err := url.Parse(string(path))
+		if err != nil {
+			if DEBUG {
+				log.Println("parsing url: ", err)
+			}
+			return nil
+		}
+
+		// Request headers
+		headers := parseHeaders(req[1], nil)
+		host := headers.Get("Host")
+
+		// Response
+		firstLine = bytes.Fields(resp[0])
+
+		// Status code
+		status, err := strconv.Atoi(string(firstLine[1]))
+		if err != nil {
+			if DEBUG {
+				log.Println("parsing status code: ", err)
+			}
+			return nil
+		}
+
+		// Response headers
+		headers = parseHeaders(resp[1], nil)
+
+		// Trailers
+		if len(resp[2]) != 0 && headers.Get("Transfer-Encoding") == "chunked" && headers.Get("Trailer") != "" {
+			lastChunkIndex := bytes.LastIndex(resp[2], append([]byte("0"), crlf...)) + 3
+			headers = parseHeaders(resp[2][lastChunkIndex:], headers)
+			resp[2] = resp[2][:lastChunkIndex]
+		}
+
+		if DEBUG {
+			log.Printf("[PARSE] Request body: % x\n", req[2])
+			log.Printf("[PARSE] Response body: % x\n", resp[2])
+		}
+
+		// Wraping it up
+		parsed.httpReq = http.Request{
+			Method: method,
+			Host:   host,
+			URL:    parsedUrl,
+			Header: headers,
+			Body:   io.NopCloser(bytes.NewReader(req[2])),
+		}
+
+		if parsedUrl.IsAbs() {
+			parsed.httpReq.RequestURI = string(path)
+		}
+
+		parsed.httpResp = http.Response{
+			StatusCode: status,
+			Header:     headers,
+			Body:       io.NopCloser(bytes.NewReader(resp[2])),
+		}
+
 		parsed.req = string(message.rawReq)
-		parsed.res = string(message.rawRes)
+		parsed.resp = string(message.rawResp)
 	} else {
-		var req, res string
+		var req, resp string
 
 		for _, frame := range toFrames(message.rawReq) {
 			if DEBUG {
@@ -399,7 +505,7 @@ func parse(message *rawMessage) *parsedMessage {
 
 		parsed.req = req
 
-		for _, frame := range toFrames(message.rawRes) {
+		for _, frame := range toFrames(message.rawResp) {
 			if DEBUG {
 				log.Printf("[PARSE] RES - RAW FRAME: % x", frame._raw)
 				log.Printf("[PARSE] RES - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
@@ -427,7 +533,7 @@ func parse(message *rawMessage) *parsedMessage {
 
 				for _, header := range headers {
 					joined := header.Name + ":" + header.Value + "\r\n"
-					res += joined
+					resp += joined
 					if DEBUG {
 						log.Println(joined)
 					}
@@ -435,7 +541,7 @@ func parse(message *rawMessage) *parsedMessage {
 			}
 
 			if frame._type == DATA {
-				res += string(frame._data)
+				resp += string(frame._data)
 				if DEBUG {
 					log.Printf("[PARSE] RES - DATA: %s\n", frame._data)
 				}
@@ -446,14 +552,14 @@ func parse(message *rawMessage) *parsedMessage {
 			}
 		}
 
-		parsed.res = res
+		parsed.resp = resp
 	}
 
 	if DEBUG {
-		log.Printf("[PARSE] Parsed Message info <len(req), len(res)>: %d, %d\n", len(parsed.req), len(parsed.res))
+		log.Printf("[PARSE] Parsed Message info <len(req), len(resp)>: %d, %d\n", len(parsed.req), len(parsed.resp))
 	}
 
-	if len(parsed.req) == 0 || len(parsed.res) == 0 {
+	if len(parsed.req) == 0 || len(parsed.resp) == 0 {
 		return nil
 	}
 
@@ -464,8 +570,35 @@ func process() {
 	for {
 		message := <-mc
 		if message != nil {
-			log.Printf("REQUEST %s\n%s\n", SEP, message.req)
-			log.Printf("RESPONSE %s\n%s\n", SEP, message.res)
+			if !message.isHttp2 {
+				log.Println("Message is HTTP1")
+
+				log.Println(message.httpReq)
+				body, err := io.ReadAll(message.httpReq.Body)
+				if err == nil {
+					bodys := "-"
+					if len(body) != 0 {
+						bodys = string(body)
+					}
+					log.Println("Request body: ", bodys)
+					message.httpReq.Body.Close()
+				}
+
+				log.Println(message.httpResp)
+				body, err = io.ReadAll(message.httpResp.Body)
+				if err == nil {
+					bodys := "-"
+					if len(body) != 0 {
+						bodys = string(body)
+					}
+					log.Println("Response body: ", bodys)
+					message.httpResp.Body.Close()
+				}
+			} else {
+				log.Println("Message is HTTP2")
+				log.Printf("REQUEST %s\n%s\n", SEP, message.req)
+				log.Printf("RESPONSE %s\n%s\n", SEP, message.resp)
+			}
 			log.Println(SEP)
 		}
 	}
