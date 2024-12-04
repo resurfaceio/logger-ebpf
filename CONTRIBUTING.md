@@ -2,7 +2,7 @@
 
 ## Configuring Development Environment
 
-Start with latest Ubuntu Jammy (22.0.4.5 or later) on Intel x86 (64-bit).
+Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit).
 
 ⚠️ ARM and Apple Silicon are not supported or recommended yet.
 
@@ -34,11 +34,12 @@ sudo ln -s /usr/bin/llvm-strip-14 /usr/bin/llvm-strip
 cd $HOME
 git clone https://github.com/resurfaceio/logger-ebpf.git
 cd logger-ebpf
+git checkout openssl-ringbuf
 make headers
 ```
 
 ### Compile and run!
 
 ```bash
-make build run
+make build run mode=client
 ```
