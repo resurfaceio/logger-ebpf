@@ -199,37 +199,8 @@ func main() {
 	messages = make(map[uint32]*rawMessage)
 	mc = make(chan *parsedMessage)
 
-	go func() {
-		var received ringbuf.Record
-		for {
-			if err := readsReader.ReadInto(&received); err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					log.Println("closing reads channel...")
-					close(r)
-					return
-				}
-				log.Printf("reading from reads reader: %s", err)
-				continue
-			}
-			r <- received
-		}
-	}()
-
-	go func() {
-		var received ringbuf.Record
-		for {
-			if err := writesReader.ReadInto(&received); err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					log.Println("closing writes channel...")
-					close(w)
-					return
-				}
-				log.Printf("reading from writes reader: %s", err)
-				continue
-			}
-			w <- received
-		}
-	}()
+	go readRing(readsReader, &r, "reads")
+	go readRing(writesReader, &w, "writes")
 
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
@@ -250,6 +221,7 @@ func main() {
 			if err := readsReader.Flush(); err != nil {
 				log.Fatalf("flushing ringbuf reads reader: %s", err)
 			}
+			// readRingOnce(readsReader, &r, "reads")
 			if err := readsReader.Close(); err != nil {
 				log.Fatalf("closing ringbuf reads reader: %s", err)
 			}
@@ -257,6 +229,7 @@ func main() {
 			if err := writesReader.Flush(); err != nil {
 				log.Fatalf("flushing ringbuf writes reader: %s", err)
 			}
+			// readRingOnce(writesReader, &w, "writes")
 			if err := writesReader.Close(); err != nil {
 				log.Fatalf("closing ringbuf writes reader: %s", err)
 			}
@@ -282,6 +255,38 @@ func main() {
 		}
 	}
 }
+
+func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
+	var received ringbuf.Record
+	for {
+		if err := reader.ReadInto(&received); err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				log.Printf("closing %s channel...\n", name)
+				close(*c)
+				return
+			}
+			log.Printf("reading from %s reader: %s", name, err)
+			continue
+		}
+		*c <- received
+	}
+}
+
+// func readRingOnce(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
+// 	log.Println("TO READ RING ONCE")
+// 	var received ringbuf.Record
+// 	if err := reader.ReadInto(&received); err != nil {
+// 		if errors.Is(err, ringbuf.ErrClosed) {
+// 			log.Printf("closing %s channel...\n", name)
+// 			close(*c)
+// 			return
+// 		}
+// 		log.Printf("reading from %s reader: %s", name, err)
+// 		log.Println("WILL RETURN")
+// 		return
+// 	}
+// 	*c <- received
+// }
 
 func ingest(rec ringbuf.Record, isReq bool) {
 	if len(rec.RawSample) < 4 {
