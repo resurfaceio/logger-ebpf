@@ -62,6 +62,6 @@ make build run
 ```
 mkdir backups
 mv gen.go main.go backups/
-sed 's/am64/arm64/g;s/x86_64/aarch64/g' backups/gen.go > gen.go
+sed 's/amd64/arm64/g;s/x86_64/aarch64/g' backups/gen.go > gen.go
 sed 's/x86_64/aarch64/g' backups/main.go > main.go
 ```
