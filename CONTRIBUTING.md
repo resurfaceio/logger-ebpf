@@ -4,7 +4,7 @@
 
 Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit).
 
-⚠️ ARM and Apple Silicon are not supported or recommended yet.
+⚠️ ARM and Apple Silicon are not supported or recommended yet*
 
 Install required Go version:
 ```bash
@@ -53,4 +53,15 @@ The values can be modified by updating the `.env` file included in this repo.
 
 ```bash
 make build run
+```
+
+------
+
+*However, if you really wanna try, do this before:
+
+```
+mkdir backups
+mv gen.go main.go backups/
+sed 's/am64/arm64/g;s/x86_64/aarch64/g' backups/gen.go > gen.go
+sed 's/x86_64/aarch64/g' backups/main.go > main.go
 ```
