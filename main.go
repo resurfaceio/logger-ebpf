@@ -16,12 +16,13 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	logger "github.com/resurfaceio/logger-go/v3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const DEBUG bool = false
+const DEBUG int = 1
 
 const (
 	DATA byte = iota
@@ -39,15 +40,19 @@ const (
 )
 
 type parsedMessage struct {
-	httpReq  http.Request
-	httpResp http.Response
-	isHttp2  bool
+	httpReq        http.Request
+	httpResp       http.Response
+	isHttp2        bool
+	responseMillis int64
+	interval       int64
 }
 
 type rawMessage struct {
 	rawReq    []byte
 	rawResp   []byte
 	createdAt time.Time
+	reqTime   time.Time
+	respTime  time.Time
 	isHttp2   bool
 	isClosed  bool
 }
@@ -68,6 +73,7 @@ var crlf []byte = []byte("\r\n")
 
 var messages map[uint32]*rawMessage
 var mc chan *parsedMessage
+var l *logger.HttpLogger
 
 func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 	//log.Println("offset: ", offset)
@@ -215,11 +221,27 @@ func main() {
 
 	//---------------------------------------------------------
 
-	isClient := len(os.Args) > 1 && os.Args[1] == "client"
+	isClient := os.Getenv("USAGE_LOGGERS_ROLE") == "client"
+
+	opts := logger.Options{Rules: os.Getenv("USAGE_LOGGERS_RULES")}
+	l, err = logger.NewHttpLogger(opts)
+	if err != nil {
+		log.Fatalln("initializing logger: ", err)
+	}
+	if !l.Enabled() {
+		log.Println("logger is not enabled")
+		return
+	}
+	if DEBUG > 0 {
+		log.Println("logger is initialized")
+		if DEBUG > 1 {
+			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
+			log.Println("  rules: ", opts.Rules)
+		}
+		log.Println("Waiting for any OpenSSL calls...")
+	}
 
 	go process()
-
-	log.Println("Waiting for any OpenSSL calls...")
 
 	for {
 		select {
@@ -251,10 +273,12 @@ func main() {
 			for id, message := range messages {
 				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
 					message.isClosed = true
-					if DEBUG {
+					if DEBUG > 1 {
 						log.Printf("[MAIN] Message %d closed for ingestion", id)
-						log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-						log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+						if DEBUG > 2 {
+							log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
+							log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+						}
 					}
 					mc <- parse(message)
 				}
@@ -300,10 +324,11 @@ func ingest(rec ringbuf.Record, isReq bool) {
 	if len(rec.RawSample) < 4 {
 		return
 	}
+	now := time.Now()
 	id := binary.LittleEndian.Uint32(rec.RawSample[:4])
 	raw := rec.RawSample[4:]
 
-	if DEBUG {
+	if DEBUG > 2 {
 		t := "RES"
 		if isReq {
 			t = "REQ"
@@ -314,13 +339,16 @@ func ingest(rec ringbuf.Record, isReq bool) {
 
 	if message, exists := messages[id]; !exists {
 		m := new(rawMessage)
-		m.createdAt = time.Now()
+		m.createdAt = now
 
 		if isReq {
+			m.reqTime = now
 			m.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
 			if m.isHttp2 {
 				raw = raw[24:]
 			}
+		} else {
+			m.respTime = now
 		}
 		messages[id] = m
 	} else {
@@ -328,10 +356,13 @@ func ingest(rec ringbuf.Record, isReq bool) {
 			return
 		}
 		if len(message.rawReq) == 0 && isReq {
+			messages[id].reqTime = now
 			messages[id].isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
 			if messages[id].isHttp2 {
 				raw = raw[24:]
 			}
+		} else if len(message.rawResp) == 0 && !isReq {
+			messages[id].respTime = now
 		}
 	}
 
@@ -365,7 +396,7 @@ func parse(message *rawMessage) *parsedMessage {
 	parsed := new(parsedMessage)
 	parsed.isHttp2 = message.isHttp2
 
-	if DEBUG {
+	if DEBUG > 1 {
 		log.Printf("[PARSE] Raw Message info <len(req), len(resp), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawResp), message.isHttp2)
 	}
 
@@ -393,7 +424,7 @@ func parse(message *rawMessage) *parsedMessage {
 		}
 		parsedUrl, err := url.Parse(string(path))
 		if err != nil {
-			if DEBUG {
+			if DEBUG > 0 {
 				log.Println("parsing url: ", err)
 			}
 			return nil
@@ -409,7 +440,7 @@ func parse(message *rawMessage) *parsedMessage {
 		// Status code
 		status, err := strconv.Atoi(string(firstLine[1]))
 		if err != nil {
-			if DEBUG {
+			if DEBUG > 0 {
 				log.Println("parsing status code: ", err)
 			}
 			return nil
@@ -425,18 +456,19 @@ func parse(message *rawMessage) *parsedMessage {
 			resp[2] = resp[2][:lastChunkIndex]
 		}
 
-		if DEBUG {
+		if DEBUG > 1 {
 			log.Printf("[PARSE] Request body: % x\n", req[2])
 			log.Printf("[PARSE] Response body: % x\n", resp[2])
 		}
 
 		// Wrap it up
 		parsed.httpReq = http.Request{
-			Method: method,
-			Host:   host,
-			URL:    parsedUrl,
-			Header: reqHeaders,
-			Body:   io.NopCloser(bytes.NewReader(req[2])),
+			Method:        method,
+			Host:          host,
+			URL:           parsedUrl,
+			Header:        reqHeaders,
+			Body:          io.NopCloser(bytes.NewReader(req[2])),
+			ContentLength: int64(len(req[2])),
 		}
 
 		if parsedUrl.IsAbs() {
@@ -444,9 +476,10 @@ func parse(message *rawMessage) *parsedMessage {
 		}
 
 		parsed.httpResp = http.Response{
-			StatusCode: status,
-			Header:     respHeaders,
-			Body:       io.NopCloser(bytes.NewReader(resp[2])),
+			StatusCode:    status,
+			Header:        respHeaders,
+			Body:          io.NopCloser(bytes.NewReader(resp[2])),
+			ContentLength: int64(len(resp[2])),
 		}
 
 	} else {
@@ -463,7 +496,7 @@ func parse(message *rawMessage) *parsedMessage {
 				label = "RESP"
 			}
 			for _, frame := range toFrames(raw) {
-				if DEBUG {
+				if DEBUG > 2 {
 					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
 					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
 						label,
@@ -485,7 +518,7 @@ func parse(message *rawMessage) *parsedMessage {
 						continue
 					}
 
-					if DEBUG {
+					if DEBUG > 1 {
 						log.Printf("[PARSE] %s - HEADERS\n", label)
 					}
 
@@ -499,11 +532,19 @@ func parse(message *rawMessage) *parsedMessage {
 							host = header.Value
 							parsedUrl.Host = header.Value
 						case ":path":
-							parsedUrl.Path = header.Value
+							pathQuery, err := url.ParseRequestURI(header.Value)
+							if err != nil {
+								if DEBUG > 0 {
+									log.Println("decoding path: ", err)
+								}
+								return nil
+							}
+							parsedUrl.Path = pathQuery.Path
+							parsedUrl.RawQuery = pathQuery.RawQuery
 						case ":status":
 							status, err = strconv.Atoi(header.Value)
 							if err != nil {
-								if DEBUG {
+								if DEBUG > 0 {
 									log.Println("parsing url: ", err)
 								}
 								return nil
@@ -515,7 +556,7 @@ func parse(message *rawMessage) *parsedMessage {
 								respHeaders.Add(header.Name, header.Value)
 							}
 						}
-						if DEBUG {
+						if DEBUG > 1 {
 							log.Println(header.Name + ":" + header.Value)
 						}
 					}
@@ -528,12 +569,12 @@ func parse(message *rawMessage) *parsedMessage {
 						respBody = append(respBody, frame._data...)
 					}
 
-					if DEBUG {
+					if DEBUG > 1 {
 						log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
 					}
 				}
 
-				if DEBUG {
+				if DEBUG > 1 {
 					log.Println(SEP)
 				}
 			}
@@ -548,6 +589,10 @@ func parse(message *rawMessage) *parsedMessage {
 				ContentLength: int64(len(reqBody)),
 			}
 
+			if parsedUrl.IsAbs() {
+				parsed.httpReq.RequestURI = parsedUrl.String()
+			}
+
 			parsed.httpResp = http.Response{
 				StatusCode:    status,
 				Header:        respHeaders,
@@ -558,6 +603,9 @@ func parse(message *rawMessage) *parsedMessage {
 
 	}
 
+	parsed.responseMillis = message.respTime.UnixMilli()
+	parsed.interval = message.respTime.Sub(message.reqTime).Abs().Milliseconds()
+
 	return parsed
 }
 
@@ -565,22 +613,29 @@ func process() {
 	for {
 		message := <-mc
 		if message != nil {
-			log.Println(SEP)
-			log.Println("Request: ", message.httpReq)
-			log.Println("Response: ", message.httpResp)
-			log.Printf("Message is HTTP2: %v\n", message.isHttp2)
+			if DEBUG > 0 {
+				log.Println(SEP)
+				log.Println("Request: ", message.httpReq)
+				log.Println("Response: ", message.httpResp)
+				log.Println("Response time: ", message.responseMillis)
+				log.Println("Interval: ", message.interval)
+				log.Printf("Message is HTTP2: %v\n", message.isHttp2)
 
-			body, err := io.ReadAll(message.httpReq.Body)
-			if err == nil {
-				log.Printf("Request body %v:\n%s\n", message.httpReq.Body, body)
-				message.httpReq.Body.Close()
-			}
+				body, err := io.ReadAll(message.httpReq.Body)
+				if err == nil {
+					log.Printf("Request body %v:\n%s\n", message.httpReq.Body, body)
+					message.httpReq.Body.Close()
+					message.httpReq.Body = io.NopCloser(bytes.NewReader(body))
+				}
 
-			body, err = io.ReadAll(message.httpResp.Body)
-			if err == nil {
-				log.Printf("Response body %v:\n%s\n", message.httpResp.Body, body)
-				message.httpResp.Body.Close()
+				body, err = io.ReadAll(message.httpResp.Body)
+				if err == nil {
+					log.Printf("Response body %v:\n%s\n", message.httpResp.Body, body)
+					message.httpResp.Body.Close()
+					message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
+				}
 			}
+			logger.SendHttpMessage(l, &message.httpResp, &message.httpReq, message.responseMillis, message.interval, nil)
 		}
 	}
 }

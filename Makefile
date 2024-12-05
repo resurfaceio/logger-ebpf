@@ -1,7 +1,12 @@
 PROJECT_NAME=logger-ebpf
 
+ifneq ($(wildcard ./.env),)
+    include .env
+	export
+endif
+
 run:
-	sudo ./ebpf-logger $(mode)
+	sudo ./ebpf-logger
 build: clean
 	go generate
 	go build
