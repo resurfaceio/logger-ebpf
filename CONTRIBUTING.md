@@ -38,8 +38,19 @@ git checkout openssl-ringbuf
 make headers
 ```
 
+#### Environment variables
+The variables used by `logger-ebpf` are:
+
+| Variable | Default |
+|----------|---------|
+|`USAGE_LOGGERS_URL` | `"http://localhost:7701/message"` |
+|`USAGE_LOGGERS_RULES` | `"include debug"` |
+|`USAGE_LOGGERS_ROLE` | `"client"` |
+
+The values can be modified by updating the `.env` file included in this repo.
+
 ### Compile and run!
 
 ```bash
-make build run mode=client
+make build run
 ```
