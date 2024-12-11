@@ -4,7 +4,7 @@
 
 Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit).
 
-⚠️ ARM and Apple Silicon are not supported or recommended yet*
+⚠️ ARM and Apple Silicon are not supported or recommended yet* (see notes)
 
 Install required Go version:
 ```bash
@@ -23,7 +23,7 @@ sudo apt install clang git libbpf-dev make
 
 Add required soft link:
 ```bash
-sudo ln -s /usr/bin/llvm-strip-14 /usr/bin/llvm-strip
+sudo ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
 ```
 
 ## Running Locally
@@ -56,8 +56,11 @@ make build run
 ```
 
 ------
+## ARM Notes
 
-*However, if you really wanna try, do this before:
+We are still trying to figure out portability. In the meantime, we need to specify a `-target` architecture in `gen.go`, as well as the correct path to any executables in `main.go`. Currently, these are the only two changes required for the logger to work on arm64. However, development is being carried out on amd64 and there are no immediate plans to support arm.
+
+Having said that, if you really wanna try your luck with ARM, do this before:
 
 ```
 mkdir backups
