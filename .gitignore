@@ -19,3 +19,4 @@ vmlinux.h
 target/
 backups/
 .vscode
+.env

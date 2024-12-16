@@ -157,11 +157,20 @@ func main() {
 
 	//---------------------------------------------------------
 
-	// Attach probes to OpenSSL executable.
+	// Attach probes to executable.
 
-	ex, err := link.OpenExecutable("/lib/x86_64-linux-gnu/libssl.so.3")
+	exPath, exists := os.LookupEnv("USAGE_LOGGERS_EBPF_EXPATH")
+	if !exists {
+		log.Fatalln("USAGE_LOGGERS_EBPF_EXPATH not set")
+	}
+
+	if DEBUG > 1 {
+		log.Println("executable: ", exPath)
+	}
+
+	ex, err := link.OpenExecutable(exPath)
 	if err != nil {
-		log.Fatal("Opening OpenSSL executable:", err)
+		log.Fatal("Opening executable:", err)
 	}
 
 	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
@@ -221,7 +230,7 @@ func main() {
 
 	//---------------------------------------------------------
 
-	isClient := os.Getenv("USAGE_LOGGERS_ROLE") == "client"
+	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
 
 	opts := logger.Options{Rules: os.Getenv("USAGE_LOGGERS_RULES")}
 	l, err = logger.NewHttpLogger(opts)

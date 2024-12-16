@@ -36,6 +36,7 @@ git clone https://github.com/resurfaceio/logger-ebpf.git
 cd logger-ebpf
 git checkout openssl-ringbuf
 make headers
+make dotenv
 ```
 
 #### Environment variables
@@ -45,9 +46,10 @@ The variables used by `logger-ebpf` are:
 |----------|---------|
 |`USAGE_LOGGERS_URL` | `"http://localhost:7701/message"` |
 |`USAGE_LOGGERS_RULES` | `"include debug"` |
-|`USAGE_LOGGERS_ROLE` | `"client"` |
+|`USAGE_LOGGERS_EBPF_ROLE` | `"client"` |
+|`USAGE_LOGGERS_EBPF_EXPATH` | `"/lib/x86_64-linux-gnu/libssl.so.3"` |
 
-The values can be modified by updating the `.env` file included in this repo.
+The values can be modified by updating the `.env` file generated with `make dotenv`.
 
 ### Compile and run!
 
