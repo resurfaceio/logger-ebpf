@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -55,6 +56,7 @@ type rawMessage struct {
 	respTime  time.Time
 	isHttp2   bool
 	isClosed  bool
+	fd        uint32
 }
 
 type h2frame struct {
@@ -71,7 +73,7 @@ type h2frame struct {
 
 var crlf []byte = []byte("\r\n")
 
-var messages map[uint32]*rawMessage
+var messages map[uint64]*rawMessage
 var mc chan *parsedMessage
 var l *logger.HttpLogger
 
@@ -151,13 +153,87 @@ func main() {
 	// Load the compiled eBPF ELF and load it into the kernel.
 	var objs loggerObjects
 	if err := loadLoggerObjects(&objs, nil); err != nil {
+		if DEBUG > 1 {
+			var verr *ebpf.VerifierError
+			if errors.As(err, &verr) {
+				log.Printf("%+v\n", verr)
+			}
+		}
 		log.Fatal("Loading eBPF objects:", err)
 	}
 	defer objs.Close()
 
 	//---------------------------------------------------------
 
-	// Attach probes to executable.
+	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
+
+	// Attach kprobes and kretprobes
+
+	if !isClient {
+		kAccept, err := link.Kprobe("sys_accept", objs.EntrySysAccept, nil)
+		if err != nil {
+			log.Fatal("Attaching kprobe:", err)
+		}
+		defer kAccept.Close()
+
+		kretAccept, err := link.Kretprobe("sys_accept", objs.RetSysAccept, nil)
+		if err != nil {
+			log.Fatal("Attaching kretprobe:", err)
+		}
+		defer kretAccept.Close()
+
+		kAccept4, err := link.Kprobe("sys_accept4", objs.EntrySysAccept4, nil)
+		if err != nil {
+			log.Fatal("Attaching kprobe:", err)
+		}
+		defer kAccept4.Close()
+
+		kretAccept4, err := link.Kretprobe("sys_accept4", objs.RetSysAccept4, nil)
+		if err != nil {
+			log.Fatal("Attaching kretprobe:", err)
+		}
+		defer kretAccept4.Close()
+	} else {
+		// kConnect, err := link.Kprobe("sys_connect", objs.EntrySysConnect, nil)
+		// if err != nil {
+		// 	log.Fatal("Attaching kprobe:", err)
+		// }
+		// defer kConnect.Close()
+
+		// kretConnect, err := link.Kretprobe("sys_connect", objs.RetSysConnect, nil)
+		// if err != nil {
+		// 	log.Fatal("Attaching kprobe:", err)
+		// }
+		// defer kretConnect.Close()
+	}
+
+	kRead, err := link.Kprobe("sys_read", objs.EntrySysRead, nil)
+	if err != nil {
+		log.Fatal("Attaching kprobe:", err)
+	}
+	defer kRead.Close()
+
+	kWrite, err := link.Kprobe("sys_write", objs.EntrySysWrite, nil)
+	if err != nil {
+		log.Fatal("Attaching kprobe:", err)
+	}
+	defer kWrite.Close()
+
+	// kClose, err := link.Kprobe("sys_close", objs.EntrySysClose, nil)
+	// if err != nil {
+	// 	log.Fatal("Attaching kprobe:", err)
+	// }
+	// defer kClose.Close()
+
+	// kretClose, err := link.Kretprobe("sys_close", objs.RetSysClose, nil)
+	// if err != nil {
+	// 	log.Fatal("Attaching kprobe:", err)
+	// }
+	// defer kretClose.Close()
+
+	//---------------------------------------------------------
+
+	// Attach uprobes and uretprobes to executable.
 
 	exPath, exists := os.LookupEnv("USAGE_LOGGERS_EBPF_EXPATH")
 	if !exists {
@@ -219,7 +295,7 @@ func main() {
 
 	r := make(chan ringbuf.Record)
 	w := make(chan ringbuf.Record)
-	messages = make(map[uint32]*rawMessage)
+	messages = make(map[uint64]*rawMessage)
 	mc = make(chan *parsedMessage)
 
 	go readRing(readsReader, &r, "reads")
@@ -229,8 +305,6 @@ func main() {
 	signal.Notify(stop, os.Interrupt)
 
 	//---------------------------------------------------------
-
-	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
 
 	opts := logger.Options{Rules: os.Getenv("USAGE_LOGGERS_RULES")}
 	l, err = logger.NewHttpLogger(opts)
@@ -251,6 +325,15 @@ func main() {
 	}
 
 	go process()
+
+	var (
+		key uint64
+		// value uint32
+	)
+
+	var value loggerTraceT
+
+	values := make(map[uint64][]uint32)
 
 	for {
 		select {
@@ -280,6 +363,7 @@ func main() {
 			ingest(record, isClient)
 		default:
 			for id, message := range messages {
+				// log.Println(id, message.isClosed, time.Since(message.createdAt))
 				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
 					message.isClosed = true
 					if DEBUG > 1 {
@@ -292,7 +376,35 @@ func main() {
 					mc <- parse(message)
 				}
 			}
-			// time.Sleep(2 * time.Second)
+
+			entries := objs.Traces.Iterate()
+
+			for entries.Next(&key, &value) {
+				if _, exists := values[key]; exists {
+					if value.Fd != values[key][0] {
+						values[key][0] = value.Fd
+						values[key][1] = 0
+					}
+				} else {
+					values[key] = []uint32{value.Fd, 0}
+				}
+			}
+
+			if err := entries.Err(); err != nil {
+				log.Fatal("Iterator encountered an error:", err)
+			}
+
+			for k, v := range values {
+				// if v != -1 {
+				if v[1] == 0 {
+					b := make([]byte, 4)
+					binary.LittleEndian.PutUint32(b, v[0])
+					log.Printf("[MAIN] PID+TGID: % x, FD: %d [% x]\n", k, v[0], b)
+					v[1] = 1
+					// objs.Fds.Delete(k)
+				}
+			}
+			time.Sleep(2 * time.Second)
 		}
 	}
 }
@@ -330,25 +442,34 @@ func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
 // }
 
 func ingest(rec ringbuf.Record, isReq bool) {
-	if len(rec.RawSample) < 4 {
+	if len(rec.RawSample) < 8 {
 		return
 	}
 	now := time.Now()
-	id := binary.LittleEndian.Uint32(rec.RawSample[:4])
-	raw := rec.RawSample[4:]
+	rawPid := rec.RawSample[:4]
+	rawFd := rec.RawSample[4:8]
+	pid := binary.LittleEndian.Uint32(rawPid)
+	fd := binary.LittleEndian.Uint32(rawFd)
+	raw := rec.RawSample[8:]
+	id := uint64(pid) | (uint64(fd) << 32)
+	rawId := make([]byte, 8)
+	binary.LittleEndian.PutUint64(rawId, id)
 
 	if DEBUG > 2 {
 		t := "RES"
 		if isReq {
 			t = "REQ"
 		}
-		log.Printf("[INGEST] TGID - %s: %d\n", t, id)
+		log.Printf("[INGEST] TGID - %s: %d [% x]\n", t, pid, rawPid)
+		log.Printf("[INGEST] FD - %s: %d [% x]\n", t, fd, rawFd)
+		log.Printf("[INGEST] FULL ID - %s: %d [% x]\n", t, id, rawId)
 		log.Printf("[INGEST] RAW - %s: % x\n", t, raw)
 	}
 
 	if message, exists := messages[id]; !exists {
 		m := new(rawMessage)
 		m.createdAt = now
+		m.fd = fd
 
 		if isReq {
 			m.reqTime = now
@@ -362,6 +483,7 @@ func ingest(rec ringbuf.Record, isReq bool) {
 		messages[id] = m
 	} else {
 		if message.isClosed {
+			delete(messages, id)
 			return
 		}
 		if len(message.rawReq) == 0 && isReq {

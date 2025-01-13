@@ -1,41 +1,102 @@
 //go:build ignore
 
 // © 2016-2024 Graylog, Inc.
-//
-// Based on sslsniff from BCC by Adrian Lopez & Mark Drayton.
 
 #include "vmlinux.h"
-// #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
-#include <bpf/bpf_helpers.h>
 
 
-// #define DEBUG_ENABLED 0
-#define MAX_BYTES 1024
+#define LOG_DISABLED        0
+#define LOG_LEVEL_ERROR     1
+#define LOG_LEVEL_WARN      2
+#define LOG_LEVEL_INFO      3
+#define LOG_LEVEL_DEBUG     4
+#define LOG_LEVEL_TRACE     5
 
-// Data buffers
+#define TRACE_CONNECTED     0x0000000F
+#define TRACE_CLOSED        0x000000F0
+#define TRACE_FLAGS_OP_AND  1
+#define TRACE_FLAGS_OP_OR   2
+#define TRACE_FLAGS_OP_XOR  3
+#define TRACE_FLAGS_OP_SHR  4
+#define TRACE_FLAGS_OP_SHL  5
+#define TRACE_FLAGS_OP_NOT  6
 
+#define READ_OP             0
+#define WRITE_OP            1
+
+#define ZERO                0
+#define MAX_U32_VALUE       0xFFFFFFFF  // max u32 = (255) + (255 << 8) + (255 << 16) + (255 << 24) = 4294967295
+
+#define MAX_BYTES           1024
+#define INVALID_FD          MAX_U32_VALUE
+#define DEBUG_LEVEL         LOG_LEVEL_ERROR
+
+/**
+ * 
+ * Data structures
+ * 
+ */
+
+/**
+ * Trace identifier
+ * Description: identifies each HTTP request/response, by attempting to
+ *              trace the network connection established using the same
+ *              file descriptor throughout the socket lifecycle; i.e.
+ *              from connect/accept/read/write/close syscalls.
+ * 
+ * [ pid (32) | tgid (32) | fd (32) | flags (32) ]
+ */
+struct trace_t {
+    u64 id;  // pid + tgid
+    u32 fd;
+    u32 flags;  // 0x0000 00ba where a: connected, b: closed
+};
+
+/**
+ * Temporary buffer
+ * Description: used to stash a reference to the buffer used by read/write syscalls.
+ * [ id (32) | *buf (8?)]
+ */
 struct data_buf_t {
     u32 id;
     const char* buf;
 };
 
+/**
+ * Data package
+ * Descrption: package with data to be sent to application in userspace through eBPF maps.
+ * [ id (32) | fd (32) | data (MAX_BYTES)]
+ */
 struct data_t {
-    // u32 pid;
-    // u32 tid;
-    // u32 uid;
     u32 id;
+    u32 fd;
     char data[MAX_BYTES];
 };
 
-// char rdata[MAX_BYTES], wdata[MAX_BYTES];
+const struct trace_t *unused __attribute__((unused));  // auto generates a given Go type with bpfgo
+
+/**
+ * 
+ * Variable declarations
+ */
+
+/**
+ * Final packaged data
+ */
 struct data_t rdata, wdata;
 
-// const struct data_t *unused __attribute__((unused));
-
+/**
+ * Temporary data stash
+ */
 struct data_buf_t reads_stash, writes_stash;
 
-// eBPF maps
+
+/**
+ * 
+ * eBPF Maps
+ * 
+ */
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -47,89 +108,553 @@ struct {
     __uint(max_entries, 4096);
 } writes SEC(".maps");
 
-// struct {
-//     __uint(type, BPF_MAP_TYPE_HASH);
-//     __type(key, __u32);
-//     __type(value, __u32);
-//     __uint(max_entries, 10);
-// } id_map SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, struct trace_t);
+    __uint(max_entries, 100);
+} traces SEC(".maps");
 
 
-// Main functions
+/**
+ * 
+ * Main functions
+ * 
+ */
 
+/**
+ * @name init_trace
+ * @brief (Re)initializes a trace with the current given pid+tgid, and a given file descriptor.
+ * 
+ * @param fd Socket file descriptor to trace.
+ * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ */
+static long init_trace(int fd) {
+    long retval;
+    u64 id = bpf_get_current_pid_tgid();
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace != NULL) {
+        trace->fd = (u32) fd;
+        trace->flags = (u32) ZERO;
+        retval = bpf_map_update_elem(&traces, &id, &trace, BPF_EXIST);
+    } else {
+        struct trace_t new_trace = {
+            .id        = id,
+            .fd        = (u32) fd,
+            .flags     = (u32) ZERO
+        };
+        retval = bpf_map_update_elem(&traces, &id, &new_trace, BPF_NOEXIST);
+    }
+
+    return retval;
+}
+
+/**
+ * @name update_trace_fd
+ * @brief Updates the trace identifier with a given socket file descriptor.
+ * 
+ * @param fd Socket file descriptor to trace.
+ * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @retval 0 if the traced file descriptor was updated successfully.
+ * @retval 1 if the trace reference is NULL.
+ */
+static long update_trace_fd(int fd) {
+    u64 id = bpf_get_current_pid_tgid();
+
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace == NULL) {
+        return 1;
+    }
+    trace->fd = (u32) fd;
+
+    return bpf_map_update_elem(&traces, &id, trace, BPF_EXIST);
+}
+
+/**
+ * update_trace_flags
+ * @brief Updates the trace identifier flags.
+ * @param operation Bitwise operation to perform on flags
+ * @param operand   Second operand for bitwise operation on flags
+ * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @retval 0 if the traces flags were updated succesfully.
+ * @retval 1 if the trace reference is NULL.
+ * @retval 2 if the operation specified is not supported.
+ */
+static long update_trace_flags(int operation, u32 operand) {
+    u64 id = bpf_get_current_pid_tgid();
+
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace == NULL) {
+        return 1;
+    }
+
+    switch (operation)
+    {
+    case TRACE_FLAGS_OP_AND:
+        trace->flags &= operand;
+        break;
+    case TRACE_FLAGS_OP_OR:
+        trace->flags |= operand;
+        break;
+    case TRACE_FLAGS_OP_XOR:
+        trace->flags ^= operand;
+        break;
+    case TRACE_FLAGS_OP_SHL:
+        trace->flags <<= operand;
+        break;
+    case TRACE_FLAGS_OP_SHR:
+        trace->flags >>= operand;
+        break;
+    case TRACE_FLAGS_OP_NOT:
+        trace->flags = ~operand;
+        break;
+    default:
+        return 2;
+    }
+
+    return bpf_map_update_elem(&traces, &id, trace, BPF_EXIST);
+}
+
+/**
+ * @name SSL_entry 
+ * @brief Stashes a reference to a given read/write data buffer buf.
+ * 
+ * To be used at SSL_read/SSL_write function entrypoints.
+ * 
+ * @param buf Pointer to read/write data buffer
+ * @param rw  Flag to indicate type of operation
+ * 
+ * @retval 0 if the reference was stashed successfully.
+ * @retval 1 if the operation specified by rw isn't supported.
+ */
 static int SSL_entry(void *buf, int rw) {
-    // int id = bpf_get_current_pid_tgid();
+    u64 id = bpf_get_current_pid_tgid();
+
+    // TODO ? - make map for stashes instead of having only one
+    //          data structure to stash reads, and one to stash writes.
+    //          Is it necessary? Should there be multiple stashes? For async access? What about race conditions?
     // buf_stash.id = id;
 
-    if (rw == 0) {
-        reads_stash.buf = buf;
-    } else {
-        writes_stash.buf = buf;
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace == NULL) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+            const static char m[] = "[DEBUG] [SSL_entry]: trace is NULL";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        init_trace(INVALID_FD);
     }
 
-    //---------------------
-    /*
-    if (DEBUG_ENABLED) {
-        int k = 0;
-        struct data_t test_data = { fd, count + '0' };
-        bpf_map_update_elem(&active_read_args_map, &k, &test_data, BPF_ANY);
+    if (rw == READ_OP) {
+        reads_stash.buf = buf;
+    } else if (rw == WRITE_OP) {
+        writes_stash.buf = buf;
+    } else {
+        if (DEBUG_LEVEL >= LOG_LEVEL_ERROR) {
+            const static char m[] = "[ERROR] [SSL_entry]: unsupported operation";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        return 1;
     }
-    */
 
     return 0;
 }
 
-
+/**
+ * @name SSL_exit
+ * @brief Retrieves read/written data from stashed buffer,
+ * adds its corresponding trace identifier, and
+ * updates the output ringbuf accordingly.
+ * 
+ * To be used at SSL_read/SSL_write function return points.
+ * 
+ * @param ctx Pointer to eBPF context variable
+ * @param rw  Flag to indicate type of operation
+ * 
+ * @return Propagates return value (casted to int) from bpf_ringbuf_output (0 on success, or a negative value in case of failure).
+ * 
+ * @retval 0 if data was successfully retrieved from buffer and submitted to output ringbuf.
+ * @retval 1 if the number of bytes read/written specified by the function rc is invalid.
+ * @retval 2 if data couldn't be read from the stashed buffer.
+ * @retval 3 if the operation specified by rw isn't supported.
+ */
 static int SSL_exit(struct pt_regs *ctx, int rw) {
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = (u32) id;
     u32 tgid = id >> 32;
-    // u32 id = (255) + (255 << 8) + (255 << 16) + (255 << 24);  // max u32 = 4294967295
+    u32 fd;
 
     int byte_count = PT_REGS_RC(ctx);
     if (byte_count <= 0) {
-        return 2;
+        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+            const static char m[] = "[DEBUG] [SSL_exit]: byte_count <= 0";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        return 1;
     }
-
     if (byte_count > MAX_BYTES) {
         byte_count = MAX_BYTES;
     }
+    u64 packaged_size = sizeof(struct data_t) - MAX_BYTES + byte_count;
 
-    
-    if (rw == 0) {
-        rdata.id = tgid;
-        bpf_probe_read_user(&rdata.data, byte_count, reads_stash.buf);
-        bpf_ringbuf_output(&reads, &rdata, byte_count + sizeof(u32), 0);
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace == NULL) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+            const static char m[] = "[DEBUG] [SSL_exit]: trace is NULL";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        fd = (u32) INVALID_FD;
     } else {
-        wdata.id = tgid;
-        bpf_probe_read_user(&wdata.data, byte_count, writes_stash.buf);
-        bpf_ringbuf_output(&writes, &wdata, byte_count + sizeof(u32), 0);
+        fd = trace->fd;
     }
 
-    
+    if (rw == READ_OP) {
+        rdata.id = tgid;
+        rdata.fd = fd;
+        if (bpf_probe_read_user(&rdata.data, byte_count, reads_stash.buf) < 0) {
+            return 2;
+        }
+        return (int) bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
+    } else if (rw == WRITE_OP) {
+        wdata.id = tgid;
+        wdata.fd = fd;
+        if (bpf_probe_read_user(&wdata.data, byte_count, writes_stash.buf) < 0) {
+            return 2;
+        }
+        return (int) bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
+    } else {
+        if (DEBUG_LEVEL >= LOG_LEVEL_ERROR) {
+            const static char m[] = "[ERROR] [SSL_exit]: unsupported operation";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        return 3;
+    }
+}
+
+/**
+ * 
+ * Kernel probes
+ * 
+ */
+
+/**
+ * 
+ * Initialize trace id with fd retrieved from the following syscalls:
+ * - sys_connect (client)
+ * - sys_accept/sys_accept4 (server)
+ */
+
+/**
+ * sys_connect
+ * Function signature: int connect(int sockfd, void* addr, int addrlen);
+ * Description: The connect() system call connects the socket referred to
+ *              by the file descriptor sockfd to the address specified by addr.
+ */
+// SEC("kprobe/sys_connect")
+// int BPF_KPROBE(entry_sys_connect, int sockfd, void* serv_addr, int addrlen) {
+//     if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+//         const static char m[] = "[kprobe/sys_connect] attempting connection with sockfd: %d [%x]";
+//         bpf_trace_printk(m, sizeof(m), sockfd, sockfd);
+//     }
+
+//     init_trace(sockfd);
+
+//     return 0;
+// }
+
+// SEC("kretprobe/sys_connect")
+// int BPF_KRETPROBE(ret_sys_connect, int rc) {
+//     if (rc < 0) {
+//         if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+//             const static char m[] = "[kretprobe/sys_connect] not connected: %d [%x]";
+//             bpf_trace_printk(m, sizeof(m), rc, rc);
+//         }
+//     } else {
+//         if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+//             const static char m[] = "[kretprobe/sys_connect] connected!";
+//             bpf_trace_printk(m, sizeof(m));
+//         }
+
+//         long retval = update_trace_flags(TRACE_FLAGS_OP_AND, TRACE_CONNECTED);
+
+//         if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG && retval !=0) {
+//             if (retval == 1) {
+//                 const static char m1[] = "[DEBUG] [kretprobe/sys_accept] [update_trace_flags]: trace is NULL";
+//                 bpf_trace_printk(m1, sizeof(m1));
+//             } else if (retval == 2) {
+//                 const static char m2[] = "[DEBUG] [kretprobe/sys_accept] [update_trace_flags]: unsupported operation";
+//                 bpf_trace_printk(m2, sizeof(m2));
+//             } else {
+//                 const static char errm[] = "[DEBUG] [kretprobe/sys_accept] [update_trace_flags] bpf_map_update: %d";
+//                 bpf_trace_printk(errm, sizeof(errm), retval);
+//             }
+//         }
+//     }
+
+//     return 0;
+// }
+
+/**
+ * sys_accept
+ * Function signature: int accept(int sockfd, void* addr, int addrlen);
+ * Description: The accept() system call extracts the first connection request
+ *              on the queue of pending connections for the listening
+ *              socket sockfd, creates a new connected socket, and returns
+ *              a new file descriptor referring to that socket.
+ */
+
+SEC("kprobe/sys_accept")
+int BPF_KPROBE(entry_sys_accept, int sockfd, void* addr, void* addrlen) {
+    if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+        const static char m[] = "[kprobe/sys_accept] attempting connection with sockfd: %d [%x]";
+        bpf_trace_printk(m, sizeof(m), sockfd, sockfd);
+    }
+
+    init_trace(sockfd);
+
     return 0;
 }
 
-// Hooks
+SEC("kretprobe/sys_accept")
+int BPF_KRETPROBE(ret_sys_accept, int fd) {
+    if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+        const static char m[] = "[kretprobe/sys_accept] new fd: %d [%x]";
+        bpf_trace_printk(m, sizeof(m), fd, fd);
+    }
+
+    if (fd < 0) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+            const static char m[] = "[kretprobe/sys_accept] not connected";
+            bpf_trace_printk(m, sizeof(m));
+        }
+    } else {
+        if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+            const static char m[] = "[kretprobe/sys_accept] connected!";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        
+        long retval = update_trace_flags(TRACE_FLAGS_OP_AND, TRACE_CONNECTED);
+
+        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG && retval !=0) {
+            if (retval == 1) {
+                const static char m1[] = "[DEBUG] [kretprobe/sys_accept] [update_trace_flags]: trace is NULL";
+                bpf_trace_printk(m1, sizeof(m1));
+            } else if (retval == 2) {
+                const static char m2[] = "[ERROR] [kretprobe/sys_accept] [update_trace_flags]: unsupported operation";
+                bpf_trace_printk(m2, sizeof(m2));
+            } else {
+                const static char errm[] = "[ERROR] [kretprobe/sys_accept] [update_trace_flags] bpf_map_update: %d";
+                bpf_trace_printk(errm, sizeof(errm), retval);
+            }
+        }
+
+        // TODO ? - trace fd further? in order to match with bio->num using openssl offsets (1.x)
+    }
+    return 0;
+}
+
+/**
+ * sys_accept4
+ * Function signature: int accept4(int sockfd, void* addr, int addrlen);
+ * Description: The accept4() system call extracts the first connection request
+ *              on the queue of pending connections for the listening
+ *              socket sockfd, creates a new connected socket, and returns
+ *              a new file descriptor referring to that socket.
+ * 
+ *              The accept4 is a non-standard linux extension for the accept syscall.
+ */
+
+SEC("kprobe/sys_accept4")
+int BPF_KPROBE(entry_sys_accept4, int sockfd, void* addr, void* addrlen, int flags) {
+    if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+        const static char m[] = "[kprobe/sys_accept4] attempting connection with sockfd: %d [%x]";
+        bpf_trace_printk(m, sizeof(m), sockfd, sockfd);
+    }
+
+    init_trace(sockfd);
+
+    return 0;
+}
+
+SEC("kretprobe/sys_accept4")
+int BPF_KRETPROBE(ret_sys_accept4, int fd) {
+    if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+        const static char m[] = "[kretprobe/sys_accept4] new fd: %d [%x]";
+        bpf_trace_printk(m, sizeof(m), fd, fd);
+    }
+
+    if (fd < 0) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+            const static char m[] = "[kretprobe/sys_accept4] not connected";
+            bpf_trace_printk(m, sizeof(m));
+        }
+    } else {
+        if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+            const static char m[] = "[kretprobe/sys_accept4] connected!";
+            bpf_trace_printk(m, sizeof(m));
+        }
+
+        long retval = update_trace_flags(TRACE_FLAGS_OP_AND, TRACE_CONNECTED);
+        
+        if (DEBUG_LEVEL == LOG_LEVEL_DEBUG && retval !=0) {
+            if (retval == 1) {
+                const static char m1[] = "[DEBUG] [kretprobe/sys_accept4] [update_trace_flags]: trace is NULL";
+                bpf_trace_printk(m1, sizeof(m1));
+            } else if (retval == 2) {
+                const static char m2[] = "[ERROR] [kretprobe/sys_accept4] [update_trace_flags]: unsupported operation";
+                bpf_trace_printk(m2, sizeof(m2));
+            } else {
+                const static char errm[] = "[ERROR] [kretprobe/sys_accept4] [update_trace_flags] bpf_map_update: %d";
+                bpf_trace_printk(errm, sizeof(errm), retval);
+            }
+        }
+
+        // TODO ? - trace fd further? in order to match with bio->num using openssl offsets (1.x)
+    }
+    return 0;
+}
+
+/**
+ * 
+ * Update trace id with fd retrieved from the following syscalls:
+ * - sys_read
+ * - sys_write
+ */
+
+// 
+
+/**
+ * sys_read
+ * Function signature: int read(int fd, void* buf, int num);
+ * Description: Reads num bytes in buf from file descriptor fd.
+ */
+SEC("kprobe/sys_read")
+int BPF_KPROBE(entry_sys_read, int fd, void* buf, int num) {
+    long retval = update_trace_fd(fd);
+    if (retval == 1) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+            const static char m[] = "[DEBUG] [kprobe/sys_read] [update_trace_fd]: trace is NULL";
+            bpf_trace_printk(m, sizeof(m));
+        }
+        retval = init_trace(fd);
+    }
+    return 0;
+}
+
+/**
+ * sys_read
+ * Function signature: int write(int fd, void* buf, int num);
+ * Description: Writes num bytes from buf to file descriptor fd.
+ */
+SEC("kprobe/sys_write")
+int BPF_KPROBE(entry_sys_write, int fd, void* buf, int num) {
+    long retval = update_trace_fd(fd);
+    if (retval == 1) {
+        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+            const static char m[] = "[DEBUG] [kprobe/sys_write] [update_trace_fd]: trace is NULL";
+            bpf_trace_printk(m, sizeof(m));
+        }
+    }
+    return 0;
+}
+
+/**
+ * 
+ * Mark message as closed with fd retrieved from the sys_close syscall.
+ */
+
+/**
+ * sys_close
+ * Function signature: int close(int fd);
+ * Description: closes a file descriptor, so that it no longer
+ *              refers to any file and may be reused. 
+ */
+// SEC("kprobe/sys_close")
+// int BPF_KPROBE(entry_sys_close, int fd) {
+//     u64 id = bpf_get_current_pid_tgid();
+
+//     if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+//         const static char m[] = "[kprobe/sys_close] id: %d [%x], fd: [%x]";
+//         bpf_trace_printk(m, sizeof(m), id, id, fd);
+//     }
+//     // return bpf_map_update_elem(&closed_stash, &id, &ufd, BPF_ANY);
+//     return 0;
+// }
+
+// SEC("kretprobe/sys_close")
+// int BPF_KRETPROBE(ret_sys_close, int rc) {
+//     if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+//         const static char m[] = "[kretprobe/sys_close] rc: %d";
+//         bpf_trace_printk(m, sizeof(m), rc);
+//     }
+
+//     if (rc == 0) {
+//         u64 id = bpf_get_current_pid_tgid();
+//         // u32* fdp = bpf_map_lookup_elem(&closed_stash, &id);
+//         if (fdp) {
+//             long retval = update_trace_flags(TRACE_FLAGS_OP_AND, TRACE_CLOSED);
+
+//             if (DEBUG_LEVEL >= LOG_LEVEL_ERROR && retval !=0) {
+//                 if (retval == 1) {
+//                     const static char m1[] = "[DEBUG] [kretprobe/sys_accept4] [update_trace_flags]: trace is NULL";
+//                     bpf_trace_printk(m1, sizeof(m1));
+//                 } else if (retval == 2) {
+//                     const static char m2[] = "[ERROR] [kretprobe/sys_accept4] [update_trace_flags]: unsupported operation";
+//                     bpf_trace_printk(m2, sizeof(m2));
+//                 } else {
+//                     const static char errm[] = "[ERROR] [kretprobe/sys_accept4] [update_trace_flags] bpf_map_update: %d";
+//                     bpf_trace_printk(errm, sizeof(errm), retval);
+//                 }
+//             }
+
+//             return retval;
+//         }
+//     }
+//     return rc;
+// }
+
+
+
+/**
+ * 
+ * User probes
+ * 
+ */
 
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
-    return (SSL_entry(buf, 0));
+    // print_fd(ssl, 0);
+    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        const static char m[] = "[DEBUG] [uprobe/SSL_read] got here!";
+        bpf_trace_printk(m, sizeof(m));
+    }
+    return (SSL_entry(buf, READ_OP));
 }
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
-    return (SSL_entry(buf, 1));
+    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        const static char m[] = "[DEBUG] [uprobe/SSL_write] got here!";
+        bpf_trace_printk(m, sizeof(m));
+    }
+    return (SSL_entry(buf, WRITE_OP));
 }
 
 SEC("uretprobe/SSL_read")
 int BPF_URETPROBE(ret_ssl_read) {
-    return (SSL_exit(ctx, 0));
+    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        const static char m[] = "[DEBUG] [uretprobe/SSL_read] got here!";
+        bpf_trace_printk(m, sizeof(m));
+    }
+    return (SSL_exit(ctx, READ_OP));
 }
 
 SEC("uretprobe/SSL_write")
 int BPF_URETPROBE(ret_ssl_write) {
-    return (SSL_exit(ctx, 1));
+    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        const static char m[] = "[DEBUG] [uretprobe/SSL_write] got here!";
+        bpf_trace_printk(m, sizeof(m));
+    }
+    return (SSL_exit(ctx, WRITE_OP));
 }
 
 char __license[] SEC("license") = "Dual MIT/GPL";
