@@ -23,7 +23,7 @@ import (
 )
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const DEBUG int = 1
+const DEBUG int = 5
 
 const (
 	DATA byte = iota
@@ -276,6 +276,19 @@ func main() {
 		log.Fatal("Attaching uretprobe:", err)
 	}
 	defer exitWrite.Close()
+
+	// SSL_connect
+	entryConnect, err := ex.Uprobe("SSL_connect", objs.EntrySslConnect, nil)
+	if err != nil {
+		log.Fatal("Attaching uprobe:", err)
+	}
+	defer entryConnect.Close()
+
+	exitConnect, err := ex.Uretprobe("SSL_connect", objs.RetSslConnect, nil)
+	if err != nil {
+		log.Fatal("Attaching uretprobe:", err)
+	}
+	defer exitConnect.Close()
 
 	//---------------------------------------------------------
 
