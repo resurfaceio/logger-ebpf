@@ -1,8 +1,9 @@
-# ignore all object and save file types
+# ignore all object, save and conf file types
 *.o
 *.save
+*.conf
 
-# ignore specific generated files
+# ignore ebpf-specific generated files
 logger_bpfeb.go
 logger_bpfeb.o
 logger_bpfel.go
@@ -16,7 +17,16 @@ vmlinux.h
 .DS_Store
 .idea
 *.iml
+.vscode
+
+# directories
 target/
 backups/
-.vscode
+fiddle/
+
+# dotenv
 .env
+
+# docker
+Dockerfile
+.dockerignore

@@ -20,10 +20,16 @@ import (
 	logger "github.com/resurfaceio/logger-go/v3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/sys/unix"
 )
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
 const DEBUG int = 5
+
+const (
+	TRACE_CLOSED     uint32 = 0x000000F0
+	TRACE_SSL_CLOSED uint32 = 0x0000F000
+)
 
 const (
 	DATA byte = iota
@@ -56,6 +62,7 @@ type rawMessage struct {
 	respTime  time.Time
 	isHttp2   bool
 	isClosed  bool
+	isParsed  bool
 	fd        uint32
 }
 
@@ -138,6 +145,24 @@ func toFrames(frameBytes []byte) (frames []h2frame) {
 	}
 
 	return
+}
+
+func isTraceClosed(trace loggerTraceT) bool {
+	log.Printf("[MAIN] Trace flags: [%08x]", trace.Flags)
+	closed := (trace.Flags & TRACE_CLOSED) == TRACE_CLOSED
+	ssl_closed := (trace.Flags & TRACE_SSL_CLOSED) == TRACE_SSL_CLOSED
+	log.Println("[MAIN] Is trace closed?", closed || ssl_closed)
+	return closed || ssl_closed
+}
+
+func getNanoKtime() uint64 {
+	var ts unix.Timespec
+	err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	if err != nil {
+		return 0
+	}
+
+	return uint64(unix.TimespecToNsec(ts))
 }
 
 func main() {
@@ -277,18 +302,46 @@ func main() {
 	}
 	defer exitWrite.Close()
 
-	// SSL_connect
-	entryConnect, err := ex.Uprobe("SSL_connect", objs.EntrySslConnect, nil)
+	if isClient {
+		// SSL_connect
+		entryConnect, err := ex.Uprobe("SSL_connect", objs.EntrySslConnect, nil)
+		if err != nil {
+			log.Fatal("Attaching uprobe:", err)
+		}
+		defer entryConnect.Close()
+
+		exitConnect, err := ex.Uretprobe("SSL_connect", objs.RetSslConnect, nil)
+		if err != nil {
+			log.Fatal("Attaching uretprobe:", err)
+		}
+		defer exitConnect.Close()
+	} else {
+		// SSL_accept
+		entryAccept, err := ex.Uprobe("SSL_accept", objs.EntrySslAccept, nil)
+		if err != nil {
+			log.Fatal("Attaching uprobe:", err)
+		}
+		defer entryAccept.Close()
+
+		exitAccept, err := ex.Uretprobe("SSL_accept", objs.RetSslAccept, nil)
+		if err != nil {
+			log.Fatal("Attaching uretprobe:", err)
+		}
+		defer exitAccept.Close()
+	}
+
+	// SSL_shutdown
+	entryShutdown, err := ex.Uprobe("SSL_shutdown", objs.EntrySslShutdown, nil)
 	if err != nil {
 		log.Fatal("Attaching uprobe:", err)
 	}
-	defer entryConnect.Close()
+	defer entryShutdown.Close()
 
-	exitConnect, err := ex.Uretprobe("SSL_connect", objs.RetSslConnect, nil)
+	exitShutdown, err := ex.Uretprobe("SSL_shutdown", objs.RetSslShutdown, nil)
 	if err != nil {
 		log.Fatal("Attaching uretprobe:", err)
 	}
-	defer exitConnect.Close()
+	defer exitShutdown.Close()
 
 	//---------------------------------------------------------
 
@@ -340,13 +393,9 @@ func main() {
 	go process()
 
 	var (
-		key uint64
-		// value uint32
+		key   uint64
+		value loggerTraceT
 	)
-
-	var value loggerTraceT
-
-	values := make(map[uint64][]uint32)
 
 	for {
 		select {
@@ -376,47 +425,64 @@ func main() {
 			ingest(record, isClient)
 		default:
 			for id, message := range messages {
-				// log.Println(id, message.isClosed, time.Since(message.createdAt))
-				if !message.isClosed && time.Since(message.createdAt) > 3*time.Second && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
-					message.isClosed = true
-					if DEBUG > 1 {
-						log.Printf("[MAIN] Message %d closed for ingestion", id)
-						if DEBUG > 2 {
-							log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-							log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+				if message.isClosed && !message.isParsed && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
+					parsed := parse(message)
+					if parsed != nil {
+						message.isParsed = true
+						if DEBUG > 1 {
+							log.Printf("[MAIN] Message %d successfully parsed.", id)
+							if DEBUG > 2 {
+								log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
+								log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+							}
 						}
+						mc <- parsed
 					}
-					mc <- parse(message)
 				}
 			}
 
 			entries := objs.Traces.Iterate()
 
 			for entries.Next(&key, &value) {
-				if _, exists := values[key]; exists {
-					if value.Fd != values[key][0] {
-						values[key][0] = value.Fd
-						values[key][1] = 0
+				pid := uint32(key)
+				id := uint64(pid) | (uint64(value.Fd) << 32)
+				log.Printf("[MAIN] Checking trace with ID=[%16x] (%d), PID=[%08x] (%d) and FD=[%08x] (%d), and TS=%d", id, id, pid, pid, value.Fd, value.Fd, value.Ts)
+				if m, exists := messages[id]; exists {
+					log.Printf("[MAIN] Message %d exists!", id)
+					if !m.isClosed && isTraceClosed(value) {
+						m.isClosed = true
+						// messages[id] = m
+						if DEBUG > 1 {
+							log.Printf("[MAIN] Message %d closed for ingestion.", id)
+						}
+					}
+
+					if m.isParsed {
+						delete(messages, id)
+						if DEBUG > 1 {
+							log.Printf("[MAIN] Message %d removed from messages map.", id)
+						}
+
+						objs.Traces.Delete(&key)
+						if DEBUG > 1 {
+							log.Printf("[MAIN] Trace %d [%x] deleted from BPF map.", id, id)
+						}
 					}
 				} else {
-					values[key] = []uint32{value.Fd, 0}
+					now := getNanoKtime()
+					if time.Duration(now-value.Ts) > 3*time.Second {
+						objs.Traces.Delete(&key)
+						if DEBUG > 1 {
+							log.Printf("[MAIN] Trace %d [%x] timed out! Trace was deleted from BPF map.", id, id)
+						}
+					}
 				}
 			}
 
 			if err := entries.Err(); err != nil {
-				log.Fatal("Iterator encountered an error:", err)
+				log.Fatal("[MAIN] Traces map iterator encountered an error:", err)
 			}
 
-			for k, v := range values {
-				// if v != -1 {
-				if v[1] == 0 {
-					b := make([]byte, 4)
-					binary.LittleEndian.PutUint32(b, v[0])
-					log.Printf("[MAIN] PID+TGID: % x, FD: %d [% x]\n", k, v[0], b)
-					v[1] = 1
-					// objs.Fds.Delete(k)
-				}
-			}
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -495,10 +561,6 @@ func ingest(rec ringbuf.Record, isReq bool) {
 		}
 		messages[id] = m
 	} else {
-		if message.isClosed {
-			delete(messages, id)
-			return
-		}
 		if len(message.rawReq) == 0 && isReq {
 			messages[id].reqTime = now
 			messages[id].isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
