@@ -1,0 +1,21 @@
+name: build release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: build
+      uses: skx/github-action-build@release-0.6.1
+      with:
+        builder: .github/build
+    - name: release
+      uses: skx/github-action-publish-binaries@release-2.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        args: 'ebpf-logger'
