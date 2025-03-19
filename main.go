@@ -13,38 +13,29 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit"
 	logger "github.com/resurfaceio/logger-go/v3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sys/unix"
 )
 
-const SEP string = "🗣️ 📢 🔥🔥🔥"
-const DEBUG int = 5
+const (
+	NOLOG int = iota
+	ERROR
+	WARN
+	INFO
+	DEBUG
+	TRACE
+)
 
 const (
 	TRACE_CLOSED     uint32 = 0x000000F0
 	TRACE_SSL_CLOSED uint32 = 0x0000F000
 )
 
-const (
-	DATA byte = iota
-	HEADERS
-	PRIORITY
-	RST_STREAM
-	SETTINGS
-	PUSH_PROMISE
-	PING
-	GOAWAY
-	WINDOW_UPDATE
-	CONTINUATION
-	ALTSVC
-	ORIGIN
-)
+const SEP string = "🗣️ 📢 🔥🔥🔥"
+const LOG_LEVEL int = DEBUG
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -55,103 +46,31 @@ type parsedMessage struct {
 }
 
 type rawMessage struct {
-	rawReq    []byte
-	rawResp   []byte
-	createdAt time.Time
-	reqTime   time.Time
-	respTime  time.Time
-	isHttp2   bool
-	isClosed  bool
-	isParsed  bool
-	fd        uint32
-}
-
-type h2frame struct {
-	_len       [3]byte
-	_lend      uint32
-	_type      byte
-	_flag      byte
-	_streamID  [4]byte
-	_streamIDd uint32
-	_data      []byte
-	_empty     bool
-	_raw       []byte
+	rawReq       []byte
+	rawResp      []byte
+	createdAt    time.Time
+	reqTime      time.Time
+	respTime     time.Time
+	isHttp2      bool
+	isClosed     bool
+	isToBeClosed bool
+	isParsed     bool
+	fd           uint32
 }
 
 var crlf []byte = []byte("\r\n")
+var httpbar []byte = []byte("HTTP/")
 
 var messages map[uint64]*rawMessage
 var mc chan *parsedMessage
 var l *logger.HttpLogger
 
-func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
-	//log.Println("offset: ", offset)
-	if offset+3 > len(barray) {
-		nextIndex = -1
-		frame._empty = true
-		return
-	}
-	copy(frame._len[:], barray[offset:3+offset])
-
-	tmp := make([]byte, 4)
-	copy(tmp[1:], frame._len[:])
-	frame._lend = binary.BigEndian.Uint32(tmp)
-	//log.Println("lend: ", frame._lend)
-
-	nextIndex = 9 + offset + int(frame._lend)
-	if nextIndex > len(barray) {
-		nextIndex = -1
-		frame._empty = true
-		return
-	}
-
-	frame._type = barray[3+offset]
-
-	if frame._type == SETTINGS {
-		// nothing
-	}
-
-	frame._flag = barray[4+offset]
-
-	copy(frame._streamID[:], barray[5+offset:9+offset])
-
-	copy(tmp[:], frame._streamID[:])
-	frame._streamIDd = binary.BigEndian.Uint32(tmp)
-
-	frame._empty = (frame._lend+uint32(frame._type)+uint32(frame._flag)+frame._streamIDd == 0)
-	if !frame._empty {
-		frame._data = make([]byte, frame._lend)
-		copy(frame._data, barray[9+offset:nextIndex])
-
-		frame._raw = make([]byte, nextIndex-offset)
-		copy(frame._raw, barray[offset:nextIndex])
-	}
-
-	return
-}
-
-func toFrames(frameBytes []byte) (frames []h2frame) {
-	var frame h2frame
-	var offset int = 0
-	// for {
-	for offset < len(frameBytes) {
-		frame, offset = toh2frame(frameBytes, offset)
-		if offset == -1 {
-			break
-		}
-		if !frame._empty {
-			frames = append(frames, frame)
-		}
-	}
-
-	return
-}
-
 func isTraceClosed(trace loggerTraceT) bool {
-	log.Printf("[MAIN] Trace flags: [%08x]", trace.Flags)
+	if LOG_LEVEL >= DEBUG {
+		log.Printf(" [MAIN] Trace flags: [%08x]", trace.Flags)
+	}
 	closed := (trace.Flags & TRACE_CLOSED) == TRACE_CLOSED
 	ssl_closed := (trace.Flags & TRACE_SSL_CLOSED) == TRACE_SSL_CLOSED
-	log.Println("[MAIN] Is trace closed?", closed || ssl_closed)
 	return closed || ssl_closed
 }
 
@@ -168,194 +87,44 @@ func getNanoKtime() uint64 {
 func main() {
 	defer log.Println("All done. Bye!")
 
-	// Remove resource limits for kernels <5.11.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatal("Removing memlock:", err)
-	}
-
-	//--------------------------------------------
-
-	// Load the compiled eBPF ELF and load it into the kernel.
-	var objs loggerObjects
-	if err := loadLoggerObjects(&objs, nil); err != nil {
-		if DEBUG > 1 {
-			var verr *ebpf.VerifierError
-			if errors.As(err, &verr) {
-				log.Printf("%+v\n", verr)
-			}
-		}
-		log.Fatal("Loading eBPF objects:", err)
-	}
-	defer objs.Close()
-
-	//---------------------------------------------------------
-
 	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
-
-	// Attach kprobes and kretprobes
-
-	if !isClient {
-		kAccept, err := link.Kprobe("sys_accept", objs.EntrySysAccept, nil)
-		if err != nil {
-			log.Fatal("Attaching kprobe:", err)
-		}
-		defer kAccept.Close()
-
-		kretAccept, err := link.Kretprobe("sys_accept", objs.RetSysAccept, nil)
-		if err != nil {
-			log.Fatal("Attaching kretprobe:", err)
-		}
-		defer kretAccept.Close()
-
-		kAccept4, err := link.Kprobe("sys_accept4", objs.EntrySysAccept4, nil)
-		if err != nil {
-			log.Fatal("Attaching kprobe:", err)
-		}
-		defer kAccept4.Close()
-
-		kretAccept4, err := link.Kretprobe("sys_accept4", objs.RetSysAccept4, nil)
-		if err != nil {
-			log.Fatal("Attaching kretprobe:", err)
-		}
-		defer kretAccept4.Close()
-	} else {
-		// kConnect, err := link.Kprobe("sys_connect", objs.EntrySysConnect, nil)
-		// if err != nil {
-		// 	log.Fatal("Attaching kprobe:", err)
-		// }
-		// defer kConnect.Close()
-
-		// kretConnect, err := link.Kretprobe("sys_connect", objs.RetSysConnect, nil)
-		// if err != nil {
-		// 	log.Fatal("Attaching kprobe:", err)
-		// }
-		// defer kretConnect.Close()
-	}
-
-	kRead, err := link.Kprobe("sys_read", objs.EntrySysRead, nil)
-	if err != nil {
-		log.Fatal("Attaching kprobe:", err)
-	}
-	defer kRead.Close()
-
-	kWrite, err := link.Kprobe("sys_write", objs.EntrySysWrite, nil)
-	if err != nil {
-		log.Fatal("Attaching kprobe:", err)
-	}
-	defer kWrite.Close()
-
-	// kClose, err := link.Kprobe("sys_close", objs.EntrySysClose, nil)
-	// if err != nil {
-	// 	log.Fatal("Attaching kprobe:", err)
-	// }
-	// defer kClose.Close()
-
-	// kretClose, err := link.Kretprobe("sys_close", objs.RetSysClose, nil)
-	// if err != nil {
-	// 	log.Fatal("Attaching kprobe:", err)
-	// }
-	// defer kretClose.Close()
-
-	//---------------------------------------------------------
-
-	// Attach uprobes and uretprobes to executable.
 
 	exPath, exists := os.LookupEnv("USAGE_LOGGERS_EBPF_EXPATH")
 	if !exists {
 		log.Fatalln("USAGE_LOGGERS_EBPF_EXPATH not set")
 	}
 
-	if DEBUG > 1 {
+	if LOG_LEVEL >= DEBUG {
 		log.Println("executable: ", exPath)
 	}
 
-	ex, err := link.OpenExecutable(exPath)
-	if err != nil {
-		log.Fatal("Opening executable:", err)
+	// Load programs
+	//---------------------------------------------------------
+	closers := load(exPath, isClient)
+	for _, c := range closers {
+		defer c.Close()
 	}
 
-	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
-
-	// SSL_read
-	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySslRead, nil)
-	if err != nil {
-		log.Fatal("Attaching uprobe:", err)
-	}
-	defer entryRead.Close()
-
-	exitRead, err := ex.Uretprobe("SSL_read", objs.RetSslRead, nil)
-	if err != nil {
-		log.Fatal("Attaching uretprobe:", err)
-	}
-	defer exitRead.Close()
-
-	// SSL_write
-	entryWrite, err := ex.Uprobe("SSL_write", objs.EntrySslWrite, nil)
-	if err != nil {
-		log.Fatal("Attaching uprobe:", err)
-	}
-	defer entryWrite.Close()
-
-	exitWrite, err := ex.Uretprobe("SSL_write", objs.RetSslWrite, nil)
-	if err != nil {
-		log.Fatal("Attaching uretprobe:", err)
-	}
-	defer exitWrite.Close()
-
-	if isClient {
-		// SSL_connect
-		entryConnect, err := ex.Uprobe("SSL_connect", objs.EntrySslConnect, nil)
-		if err != nil {
-			log.Fatal("Attaching uprobe:", err)
-		}
-		defer entryConnect.Close()
-
-		exitConnect, err := ex.Uretprobe("SSL_connect", objs.RetSslConnect, nil)
-		if err != nil {
-			log.Fatal("Attaching uretprobe:", err)
-		}
-		defer exitConnect.Close()
-	} else {
-		// SSL_accept
-		entryAccept, err := ex.Uprobe("SSL_accept", objs.EntrySslAccept, nil)
-		if err != nil {
-			log.Fatal("Attaching uprobe:", err)
-		}
-		defer entryAccept.Close()
-
-		exitAccept, err := ex.Uretprobe("SSL_accept", objs.RetSslAccept, nil)
-		if err != nil {
-			log.Fatal("Attaching uretprobe:", err)
-		}
-		defer exitAccept.Close()
-	}
-
-	// SSL_shutdown
-	entryShutdown, err := ex.Uprobe("SSL_shutdown", objs.EntrySslShutdown, nil)
-	if err != nil {
-		log.Fatal("Attaching uprobe:", err)
-	}
-	defer entryShutdown.Close()
-
-	exitShutdown, err := ex.Uretprobe("SSL_shutdown", objs.RetSslShutdown, nil)
-	if err != nil {
-		log.Fatal("Attaching uretprobe:", err)
-	}
-	defer exitShutdown.Close()
-
+	// Retrieve maps
 	//---------------------------------------------------------
 
+	objs, ok := closers[0].(*loggerObjects)
+	if !ok {
+		log.Panic("error trying to access maps: first item is not *loggerObjects")
+	}
+
 	// Define structures to receive data
+	//---------------------------------------------------------
 
 	readsReader, err := ringbuf.NewReader(objs.Reads)
 	if err != nil {
-		log.Fatalf("opening ringbuf reader: %s", err)
+		log.Panicf("opening ringbuf reader: %s", err)
 	}
 	defer readsReader.Close()
 
 	writesReader, err := ringbuf.NewReader(objs.Writes)
 	if err != nil {
-		log.Fatalf("opening ringbuf reader: %s", err)
+		log.Panicf("opening ringbuf reader: %s", err)
 	}
 	defer writesReader.Close()
 
@@ -375,15 +144,20 @@ func main() {
 	opts := logger.Options{Rules: os.Getenv("USAGE_LOGGERS_RULES")}
 	l, err = logger.NewHttpLogger(opts)
 	if err != nil {
-		log.Fatalln("initializing logger: ", err)
-	}
-	if !l.Enabled() {
-		log.Println("logger is not enabled")
+		if LOG_LEVEL >= ERROR {
+			log.Println("initializing logger: ", err)
+		}
 		return
 	}
-	if DEBUG > 0 {
+	if !l.Enabled() {
+		if LOG_LEVEL >= ERROR {
+			log.Println("logger is not enabled")
+		}
+		return
+	}
+	if LOG_LEVEL >= INFO {
 		log.Println("logger is initialized")
-		if DEBUG > 1 {
+		if LOG_LEVEL >= DEBUG {
 			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
 			log.Println("  rules: ", opts.Rules)
 		}
@@ -403,19 +177,29 @@ func main() {
 			log.Println("Received signal, exiting...")
 
 			if err := readsReader.Flush(); err != nil {
-				log.Fatalf("flushing ringbuf reads reader: %s", err)
+				if LOG_LEVEL >= ERROR {
+					log.Printf("flushing ringbuf reads reader: %s", err)
+				}
+				return
 			}
-			// readRingOnce(readsReader, &r, "reads")
 			if err := readsReader.Close(); err != nil {
-				log.Fatalf("closing ringbuf reads reader: %s", err)
+				if LOG_LEVEL >= ERROR {
+					log.Printf("closing ringbuf reads reader: %s", err)
+				}
+				return
 			}
 
 			if err := writesReader.Flush(); err != nil {
-				log.Fatalf("flushing ringbuf writes reader: %s", err)
+				if LOG_LEVEL >= ERROR {
+					log.Printf("flushing ringbuf writes reader: %s", err)
+				}
+				return
 			}
-			// readRingOnce(writesReader, &w, "writes")
 			if err := writesReader.Close(); err != nil {
-				log.Fatalf("closing ringbuf writes reader: %s", err)
+				if LOG_LEVEL >= ERROR {
+					log.Printf("closing ringbuf writes reader: %s", err)
+				}
+				return
 			}
 			return
 
@@ -426,17 +210,21 @@ func main() {
 		default:
 			for id, message := range messages {
 				if message.isClosed && !message.isParsed && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
-					parsed := parse(message)
-					if parsed != nil {
-						message.isParsed = true
-						if DEBUG > 1 {
-							log.Printf("[MAIN] Message %d successfully parsed.", id)
-							if DEBUG > 2 {
-								log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-								log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+					var isFinished bool
+					var parsed *parsedMessage
+					for !isFinished {
+						parsed, isFinished = parse(message)
+						if parsed != nil {
+							message.isParsed = true
+							if LOG_LEVEL >= DEBUG {
+								log.Printf("[MAIN] Message [%16x] successfully parsed.", id)
+								if LOG_LEVEL >= TRACE {
+									log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
+									log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+								}
 							}
+							mc <- parsed
 						}
-						mc <- parsed
 					}
 				}
 			}
@@ -444,46 +232,57 @@ func main() {
 			entries := objs.Traces.Iterate()
 
 			for entries.Next(&key, &value) {
+				now := getNanoKtime()
+				delta := time.Duration(now - value.Ts)
 				pid := uint32(key)
 				id := uint64(pid) | (uint64(value.Fd) << 32)
-				log.Printf("[MAIN] Checking trace with ID=[%16x] (%d), PID=[%08x] (%d) and FD=[%08x] (%d), and TS=%d", id, id, pid, pid, value.Fd, value.Fd, value.Ts)
+				log.Printf("[MAIN] Checking trace with ID=[%16x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)", id, pid, pid, value.Fd, value.Ts, now)
 				if m, exists := messages[id]; exists {
-					log.Printf("[MAIN] Message %d exists!", id)
-					if !m.isClosed && isTraceClosed(value) {
+					if LOG_LEVEL >= DEBUG {
+						log.Printf("[MAIN] Message %d exists!", id)
+					}
+
+					if !m.isClosed && m.isToBeClosed {
 						m.isClosed = true
-						// messages[id] = m
-						if DEBUG > 1 {
-							log.Printf("[MAIN] Message %d closed for ingestion.", id)
+						if LOG_LEVEL >= DEBUG {
+							log.Printf("[MAIN] Message [%16x] closed for ingestion.", id)
 						}
 					}
 
-					if m.isParsed {
+					if !m.isClosed && !m.isToBeClosed && isTraceClosed(value) {
+						m.isToBeClosed = true
+						if LOG_LEVEL >= TRACE {
+							log.Printf("[MAIN] Message [%16x] to be closed for ingestion in the next check.", id)
+						}
+					}
+
+					if m.isParsed || delta > 10*time.Second {
 						delete(messages, id)
-						if DEBUG > 1 {
-							log.Printf("[MAIN] Message %d removed from messages map.", id)
+						if LOG_LEVEL >= TRACE {
+							log.Printf("[MAIN] Message [%16x] removed from messages map.", id)
 						}
 
 						objs.Traces.Delete(&key)
-						if DEBUG > 1 {
-							log.Printf("[MAIN] Trace %d [%x] deleted from BPF map.", id, id)
+						if LOG_LEVEL >= TRACE {
+							log.Printf("[MAIN] Trace [% x] deleted from BPF map.", key)
 						}
 					}
-				} else {
-					now := getNanoKtime()
-					if time.Duration(now-value.Ts) > 3*time.Second {
-						objs.Traces.Delete(&key)
-						if DEBUG > 1 {
-							log.Printf("[MAIN] Trace %d [%x] timed out! Trace was deleted from BPF map.", id, id)
-						}
+				} else if delta > 5*time.Second {
+					objs.Traces.Delete(&key)
+					if LOG_LEVEL >= TRACE {
+						log.Printf("[MAIN] Trace [% x] timed out! Trace was deleted from BPF map.", id)
 					}
 				}
 			}
 
 			if err := entries.Err(); err != nil {
-				log.Fatal("[MAIN] Traces map iterator encountered an error:", err)
+				if LOG_LEVEL >= ERROR {
+					log.Println("[MAIN] Traces map iterator encountered an error:", err)
+				}
+				return
 			}
 
-			time.Sleep(2 * time.Second)
+			time.Sleep(3 * time.Second)
 		}
 	}
 }
@@ -493,32 +292,20 @@ func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
 	for {
 		if err := reader.ReadInto(&received); err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Printf("closing %s channel...\n", name)
+				if LOG_LEVEL >= INFO {
+					log.Printf("closing %s channel...\n", name)
+				}
 				close(*c)
 				return
 			}
-			log.Printf("reading from %s reader: %s", name, err)
+			if LOG_LEVEL >= INFO {
+				log.Printf("reading from %s reader: %s", name, err)
+			}
 			continue
 		}
 		*c <- received
 	}
 }
-
-// func readRingOnce(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
-// 	log.Println("TO READ RING ONCE")
-// 	var received ringbuf.Record
-// 	if err := reader.ReadInto(&received); err != nil {
-// 		if errors.Is(err, ringbuf.ErrClosed) {
-// 			log.Printf("closing %s channel...\n", name)
-// 			close(*c)
-// 			return
-// 		}
-// 		log.Printf("reading from %s reader: %s", name, err)
-// 		log.Println("WILL RETURN")
-// 		return
-// 	}
-// 	*c <- received
-// }
 
 func ingest(rec ringbuf.Record, isReq bool) {
 	if len(rec.RawSample) < 8 {
@@ -534,18 +321,21 @@ func ingest(rec ringbuf.Record, isReq bool) {
 	rawId := make([]byte, 8)
 	binary.LittleEndian.PutUint64(rawId, id)
 
-	if DEBUG > 2 {
-		t := "RES"
+	if LOG_LEVEL >= DEBUG {
+		t := "RESP"
 		if isReq {
 			t = "REQ"
 		}
-		log.Printf("[INGEST] TGID - %s: %d [% x]\n", t, pid, rawPid)
-		log.Printf("[INGEST] FD - %s: %d [% x]\n", t, fd, rawFd)
-		log.Printf("[INGEST] FULL ID - %s: %d [% x]\n", t, id, rawId)
-		log.Printf("[INGEST] RAW - %s: % x\n", t, raw)
+		log.Printf("[INGEST] %s - TRACE ID: %d [% x] (TGID: %d [% x], FD: %d [% x])\n", t, id, rawId, pid, rawPid, fd, rawFd)
+		if LOG_LEVEL >= TRACE {
+			log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, raw)
+		}
 	}
 
 	if message, exists := messages[id]; !exists {
+		if LOG_LEVEL >= DEBUG {
+			log.Println(SEP)
+		}
 		m := new(rawMessage)
 		m.createdAt = now
 		m.fd = fd
@@ -598,27 +388,38 @@ func parseHeaders(toParse []byte, existingHeaders http.Header) (headers http.Hea
 	return
 }
 
-func parse(message *rawMessage) *parsedMessage {
-	parsed := new(parsedMessage)
+func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
+	consumed = true
+	parsed = new(parsedMessage)
 	parsed.isHttp2 = message.isHttp2
 
-	if DEBUG > 1 {
+	if LOG_LEVEL >= TRACE {
 		log.Printf("[PARSE] Raw Message info <len(req), len(resp), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawResp), message.isHttp2)
 	}
 
 	if !message.isHttp2 {
+		// [first-line, headers, body+trailers]
 		var req [3][]byte
 		var resp [3][]byte
 
-		// Slice first line, headers, body+trailers
+		// Slice first line, headers+body+trailers
 		copy(req[:2], bytes.SplitN(message.rawReq, crlf, 2))
 		copy(resp[:2], bytes.SplitN(message.rawResp, crlf, 2))
 
+		// Slice headers, body+trailers
 		copy(req[1:], bytes.SplitN(req[1], append(crlf, crlf...), 2))
 		copy(resp[1:], bytes.SplitN(resp[1], append(crlf, crlf...), 2))
 
 		// Request
 		firstLine := bytes.Fields(req[0])
+
+		if len(firstLine) <= 1 {
+			if LOG_LEVEL >= ERROR {
+				log.Printf("[PARSE] ERROR: couldn't parse message as HTTP1. Attempting again as HTTP2")
+			}
+			message.isHttp2 = true
+			return nil, false
+		}
 
 		// Method
 		method := string(firstLine[0])
@@ -630,10 +431,10 @@ func parse(message *rawMessage) *parsedMessage {
 		}
 		parsedUrl, err := url.Parse(string(path))
 		if err != nil {
-			if DEBUG > 0 {
+			if LOG_LEVEL >= ERROR {
 				log.Println("parsing url: ", err)
 			}
-			return nil
+			return nil, consumed
 		}
 
 		// Request headers
@@ -646,23 +447,53 @@ func parse(message *rawMessage) *parsedMessage {
 		// Status code
 		status, err := strconv.Atoi(string(firstLine[1]))
 		if err != nil {
-			if DEBUG > 0 {
+			if LOG_LEVEL >= ERROR {
 				log.Println("parsing status code: ", err)
 			}
-			return nil
+			return nil, consumed
 		}
 
 		// Response headers
 		respHeaders := parseHeaders(resp[1], nil)
 
+		// Split additional raw messages if present
+
+		// Request
+		if newReqIndex := bytes.Index(req[2], httpbar); newReqIndex != -1 {
+			if newReqIndex = bytes.LastIndex(req[2][:newReqIndex], crlf); newReqIndex != -1 {
+				message.rawReq = req[2][newReqIndex:]
+				req[2] = req[2][:newReqIndex]
+			} else {
+				// empty body (all of req[2] is another request entirely)
+				message.rawReq = req[2]
+				req[2] = nil
+			}
+			consumed = false
+		}
+
+		// Response
+		if newRespIndex := bytes.Index(resp[2], httpbar); newRespIndex != -1 {
+			message.rawResp = resp[2][newRespIndex:]
+			resp[2] = resp[2][:newRespIndex]
+			consumed = false
+		}
+
 		// Trailers
+		if len(req[2]) != 0 && reqHeaders.Get("Transfer-Encoding") == "chunked" && reqHeaders.Get("Trailer") != "" {
+			lastChunkIndex := bytes.LastIndex(req[2], append([]byte("0"), crlf...)) + 3
+			reqHeaders = parseHeaders(req[2][lastChunkIndex:], reqHeaders)
+			req[2] = req[2][:lastChunkIndex]
+		}
+
 		if len(resp[2]) != 0 && respHeaders.Get("Transfer-Encoding") == "chunked" && respHeaders.Get("Trailer") != "" {
 			lastChunkIndex := bytes.LastIndex(resp[2], append([]byte("0"), crlf...)) + 3
 			respHeaders = parseHeaders(resp[2][lastChunkIndex:], respHeaders)
 			resp[2] = resp[2][:lastChunkIndex]
 		}
 
-		if DEBUG > 1 {
+		// Bodies
+
+		if LOG_LEVEL >= DEBUG {
 			log.Printf("[PARSE] Request body: % x\n", req[2])
 			log.Printf("[PARSE] Response body: % x\n", resp[2])
 		}
@@ -702,7 +533,7 @@ func parse(message *rawMessage) *parsedMessage {
 				label = "RESP"
 			}
 			for _, frame := range toFrames(raw) {
-				if DEBUG > 2 {
+				if LOG_LEVEL >= TRACE {
 					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
 					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
 						label,
@@ -724,7 +555,7 @@ func parse(message *rawMessage) *parsedMessage {
 						continue
 					}
 
-					if DEBUG > 1 {
+					if LOG_LEVEL >= DEBUG {
 						log.Printf("[PARSE] %s - HEADERS\n", label)
 					}
 
@@ -740,20 +571,20 @@ func parse(message *rawMessage) *parsedMessage {
 						case ":path":
 							pathQuery, err := url.ParseRequestURI(header.Value)
 							if err != nil {
-								if DEBUG > 0 {
+								if LOG_LEVEL >= ERROR {
 									log.Println("decoding path: ", err)
 								}
-								return nil
+								return nil, false
 							}
 							parsedUrl.Path = pathQuery.Path
 							parsedUrl.RawQuery = pathQuery.RawQuery
 						case ":status":
 							status, err = strconv.Atoi(header.Value)
 							if err != nil {
-								if DEBUG > 0 {
+								if LOG_LEVEL >= ERROR {
 									log.Println("parsing url: ", err)
 								}
-								return nil
+								return nil, false
 							}
 						default:
 							if i == 0 {
@@ -762,7 +593,7 @@ func parse(message *rawMessage) *parsedMessage {
 								respHeaders.Add(header.Name, header.Value)
 							}
 						}
-						if DEBUG > 1 {
+						if LOG_LEVEL >= DEBUG {
 							log.Println(header.Name + ":" + header.Value)
 						}
 					}
@@ -775,12 +606,12 @@ func parse(message *rawMessage) *parsedMessage {
 						respBody = append(respBody, frame._data...)
 					}
 
-					if DEBUG > 1 {
+					if LOG_LEVEL >= DEBUG {
 						log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
 					}
 				}
 
-				if DEBUG > 1 {
+				if LOG_LEVEL >= TRACE {
 					log.Println(SEP)
 				}
 			}
@@ -812,31 +643,31 @@ func parse(message *rawMessage) *parsedMessage {
 	parsed.responseMillis = message.respTime.UnixMilli()
 	parsed.interval = message.respTime.Sub(message.reqTime).Abs().Milliseconds()
 
-	return parsed
+	return parsed, consumed
 }
 
 func process() {
 	for {
 		message := <-mc
 		if message != nil {
-			if DEBUG > 0 {
+			if LOG_LEVEL >= DEBUG {
 				log.Println(SEP)
-				log.Println("Request: ", message.httpReq)
-				log.Println("Response: ", message.httpResp)
-				log.Println("Response time: ", message.responseMillis)
-				log.Println("Interval: ", message.interval)
-				log.Printf("Message is HTTP2: %v\n", message.isHttp2)
+				log.Println("[PROCESS] Request: ", message.httpReq)
+				log.Println("[PROCESS] Response: ", message.httpResp)
+				log.Println("[PROCESS] Response time: ", message.responseMillis)
+				log.Println("[PROCESS] Interval: ", message.interval)
+				log.Printf("[PROCESS] Message is HTTP2: %v\n", message.isHttp2)
 
 				body, err := io.ReadAll(message.httpReq.Body)
 				if err == nil {
-					log.Printf("Request body %v:\n%s\n", message.httpReq.Body, body)
+					log.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
 					message.httpReq.Body.Close()
 					message.httpReq.Body = io.NopCloser(bytes.NewReader(body))
 				}
 
 				body, err = io.ReadAll(message.httpResp.Body)
 				if err == nil {
-					log.Printf("Response body %v:\n%s\n", message.httpResp.Body, body)
+					log.Printf("[PROCESS] Response body %v:\n%s\n", message.httpResp.Body, body)
 					message.httpResp.Body.Close()
 					message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
 				}

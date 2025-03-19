@@ -23,10 +23,12 @@ vmlinux.h
 target/
 backups/
 fiddle/
+k8s/
 
 # dotenv
 .env
 
 # docker
-Dockerfile
+Dockerfile*
+Containerfile*
 .dockerignore

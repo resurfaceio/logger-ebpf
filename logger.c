@@ -7,18 +7,19 @@
 
 
 #define LOG_DISABLED        0  // Disable all trace logging.
-#define LOG_LEVEL_ERROR     1  // Log fatal errors only.
-#define LOG_LEVEL_WARN      2  // Log fatal and non-fatal errors.
-#define LOG_LEVEL_INFO      3  // Log errors and basic non-error details.
-#define LOG_LEVEL_DEBUG     4  // Log errors and non-error details.
-#define LOG_LEVEL_TRACE     5  // Log all details.
+#define LOG_ERROR           1  // Log fatal errors only.
+#define LOG_WARN            2  // Log fatal and non-fatal errors.
+#define LOG_INFO            3  // Log errors and basic non-error details.
+#define LOG_DEBUG           4  // Log errors and non-error details.
+#define LOG_TRACE           5  // Log almost all details, except noisy ones (i.e. "trace is NULL" and sys_close logs).
+#define LOG_TRACE_ALL       6  // Log all details.
 
 #define TRACE_CONNECTED     0x0000000F
 #define TRACE_CLOSED        0x000000F0
 #define TRACE_SSL_CONNECTED 0x00000F00
 #define TRACE_SSL_CLOSED    0x0000F000
 #define TRACE_SSL_AJAR      0x0000C000
-#define TRACE_MASK          0x0000FFFF
+#define TRACE_MASK          0xF0000000
 #define TRACE_FLAGS_OP_AND  1
 #define TRACE_FLAGS_OP_OR   2
 #define TRACE_FLAGS_OP_XOR  3
@@ -34,7 +35,7 @@
 
 #define MAX_BYTES           1024
 #define INVALID_FD          MAX_U32_VALUE
-#define DEBUG_LEVEL         LOG_LEVEL_TRACE
+#define LOG_LEVEL           LOG_DEBUG
 
 /**
  * 
@@ -44,17 +45,21 @@
 
 /**
  * Trace identifier
- * Description: identifies each HTTP request/response, by attempting to
- *              trace the network connection established using the same
- *              file descriptor throughout the socket lifecycle; i.e.
- *              from connect/accept/read/write/close syscalls.
+ * Description: holds the value of the socket file descriptor used to establish
+ *              the underlying network connection for each HTTP request/response,
+ *              by attempting to trace it throughout the socket lifecycle; i.e.
+ *              from connect/accept/read/write/close syscalls. In addition, this
+ *              struct keeps track of its initialization time as a u64 timestamp,
+ *              as well as references to two buffers: reads, and writes.
  * 
- * [ fd (32) | flags (32) | ts (64) ]
+ * [ fd (32) | flags (32) | ts (64) | readsbp (64) | writesbp (64) ]
  */
 struct trace_t {
     u32 fd;
     u32 flags;  // 0x0000 00ba where a: connected, b: closed
     u64 ts;
+    uintptr_t readsbp;
+    uintptr_t writesbp;
 };
 
 /**
@@ -86,14 +91,9 @@ const struct trace_t *unused __attribute__((unused));  // auto generates a given
  */
 
 /**
- * Final packaged data
+ * Packaged data
  */
 struct data_t rdata, wdata;
-
-/**
- * Temporary data stash
- */
-struct data_buf_t reads_stash, writes_stash;
 
 
 /**
@@ -135,23 +135,26 @@ struct {
  */
 static void printk(int level, char* origin, char* message) {
     const static char log[] = "[%-5s] [%-22s]: %s";
-    if (DEBUG_LEVEL >= level)  {
+    if (LOG_LEVEL >= level)  {
         switch (level)
         {
-        case LOG_LEVEL_ERROR:
+        case LOG_ERROR:
             bpf_trace_printk(log, sizeof(log), "ERROR", origin, message);
             break;
-        case LOG_LEVEL_WARN:
+        case LOG_WARN:
             bpf_trace_printk(log, sizeof(log), "WARN ", origin, message);
             break;
-        case LOG_LEVEL_INFO:
+        case LOG_INFO:
             bpf_trace_printk(log, sizeof(log), "INFO ", origin, message);
             break;
-        case LOG_LEVEL_DEBUG:
+        case LOG_DEBUG:
             bpf_trace_printk(log, sizeof(log), "DEBUG", origin, message);
             break;
-        case LOG_LEVEL_TRACE:
+        case LOG_TRACE:
             bpf_trace_printk(log, sizeof(log), "TRACE", origin, message);
+            break;
+        case LOG_TRACE_ALL:
+            bpf_trace_printk(log, sizeof(log), "TRALL", origin, message);
             break;
         default:
             bpf_trace_printk(log, sizeof(log), "?????", origin, message);
@@ -176,28 +179,34 @@ static void printk(int level, char* origin, char* message) {
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  */
 static long init_trace(int fd, int create_only) {
-    long retval;
+    u64 exists;
     u64 id = bpf_get_current_pid_tgid();
     u64 ktime = bpf_ktime_get_ns();
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace != NULL) {
         if (create_only != 0) {
             return 0;
-        }
-        trace->fd      = (u32) fd;
-        trace->flags   = (u32) ZERO;
-        trace->ts      = ktime;
-        retval = bpf_map_update_elem(&traces, &id, &trace, BPF_EXIST);
+        };
+        trace->flags    = (u32) ZERO;
+        trace->readsbp  = (uintptr_t) ZERO;
+        trace->writesbp = (uintptr_t) ZERO;
+
+        exists = BPF_EXIST;
     } else {
         struct trace_t new_trace = {
-            .fd        = (u32) fd,
-            .flags     = (u32) ZERO,
-            .ts        = ktime
+            .flags      = (u32) ZERO,
+            .readsbp    = (uintptr_t) ZERO,
+            .writesbp   = (uintptr_t) ZERO,
         };
-        retval = bpf_map_update_elem(&traces, &id, &new_trace, BPF_NOEXIST);
+        trace = &new_trace;
+
+        exists = BPF_NOEXIST;
     }
 
-    return retval;
+    trace->ts = ktime;
+    trace->fd = (u32) fd;
+
+    return bpf_map_update_elem(&traces, &id, trace, exists);
 }
 
 /**
@@ -280,7 +289,7 @@ static long update_trace_fd(int fd) {
     if (trace == NULL) {
         return 2;
     }
-    u32 current_flags = trace->flags;
+
     if (is_closed(trace)) {
         return 3;
     }
@@ -315,12 +324,16 @@ static long update_trace_flags(int operation, u32 operand) {
         return 1;
     }
 
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [update_trace_flags    ]: current trace flags [%08x]";
         bpf_trace_printk(m, sizeof(m), trace->flags);
     }
 
     u32 current_flags = trace->flags;
+
+    if ((current_flags & TRACE_MASK) != ZERO) {
+        current_flags = (u32) ZERO;
+    }
 
     switch (operation)
     {
@@ -346,9 +359,9 @@ static long update_trace_flags(int operation, u32 operand) {
         return 2;
     }
 
-    trace->flags = current_flags & TRACE_MASK;
+    trace->flags = current_flags;
 
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [update_trace_flags    ]: new trace flags     [%08x]";
         bpf_trace_printk(m, sizeof(m), trace->flags);
     }
@@ -366,6 +379,7 @@ static long update_trace_flags(int operation, u32 operand) {
  * @param buf Pointer to read/write data buffer
  * @param rw  Flag to indicate type of operation
  * 
+ * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  * @retval 0 if the reference was stashed successfully.
  * @retval 1 if the underlying network calls are not being traced (trace is NULL).
  * @retval 2 if the underlying network connection does not exist (trace is NOT connected).
@@ -381,25 +395,25 @@ static int SSL_entry(void *buf, int rw) {
 
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace == NULL) {
-        printk(LOG_LEVEL_TRACE, "SSL_entry", "trace is NULL");
+        printk(LOG_TRACE, "SSL_entry", "trace is NULL");
         return 1;
     }
 
     if (!is_connected(trace)) {
-        printk(LOG_LEVEL_TRACE, "SSL_entry", "trace is NOT connected");
+        printk(LOG_TRACE, "SSL_entry", "trace is NOT connected");
         return 2;
     }
 
     if (rw == READ_OP) {
-        reads_stash.buf = buf;
+        trace->readsbp = (uintptr_t) buf;
     } else if (rw == WRITE_OP) {
-        writes_stash.buf = buf;
+        trace->writesbp = (uintptr_t) buf;
     } else {
-        printk(LOG_LEVEL_ERROR, "SSL_entry", "unsupported operation");
+        printk(LOG_ERROR, "SSL_entry", "unsupported operation");
         return 3;
     }
 
-    return 0;
+    return bpf_map_update_elem(&traces, &id, trace, BPF_EXIST);
 }
 
 /**
@@ -427,11 +441,11 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
     u32 pid = (u32) id;
     u32 tgid = id >> 32;
     u32 fd;
-    u64 ts;
+    char *buf;
 
     int byte_count = PT_REGS_RC(ctx);
     if (byte_count <= 0) {
-        printk(LOG_LEVEL_INFO, "SSL_exit", "byte_count <= 0");
+        printk(LOG_DEBUG, "SSL_exit", "byte_count <= 0");
         return 3;
     }
     if (byte_count > MAX_BYTES) {
@@ -441,56 +455,65 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
 
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace == NULL) {
-        printk(LOG_LEVEL_TRACE, "SSL_exit", "trace is NULL");
+        printk(LOG_TRACE, "SSL_exit", "trace is NULL");
         return 1;
-    } else {
-        if (!is_connected(trace)) {
-            printk(LOG_LEVEL_TRACE, "SSL_exit", "trace is NOT connected");
-            return 2;
-        }
-        fd = trace->fd;
-        ts = trace->ts;
     }
+
+    if (!is_connected(trace)) {
+        printk(LOG_TRACE, "SSL_exit", "trace is NOT connected");
+        return 2;
+    }
+
+    fd = trace->fd;
+
+    printk(LOG_DEBUG, "SSL_exit", "message ready for ringbuf");
 
     if (rw == READ_OP) {
         rdata.id = tgid;
         rdata.fd = fd;
-        if (bpf_probe_read_user(&rdata.data, byte_count, reads_stash.buf) < 0) {
+        buf = (char *) trace->readsbp;
+        if (bpf_probe_read_user(&rdata.data, byte_count, buf) < 0) {
             return 4;
         }
         return (int) bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
     } else if (rw == WRITE_OP) {
         wdata.id = tgid;
         wdata.fd = fd;
-        if (bpf_probe_read_user(&wdata.data, byte_count, writes_stash.buf) < 0) {
+        buf = (char *) trace->writesbp;
+        if (bpf_probe_read_user(&wdata.data, byte_count, buf) < 0) {
             return 4;
         }
         return (int) bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
     } else {
-        printk(LOG_LEVEL_ERROR, "SSL_exit", "unsupported operation");
+        printk(LOG_ERROR, "SSL_exit", "unsupported operation");
         return 5;
     }
 }
 
 static int entry_accept(int fd, int is_accept4) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [kprobe/sys_accept%s    ]: attempting connection with socket fd: %d [%x]";
         bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
     }
 
-    init_trace(fd, 0);
+    long rc = init_trace(fd, 0);
+    
+    if (LOG_LEVEL >= LOG_DEBUG) {
+        const static char m[] = "[DEBUG] [kprobe/sys_accept%s    ]: init_trace rc: %d";
+        bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", rc);
+    }
 
     return 0;
 }
 
 static int exit_accept(int fd, int is_accept4) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+    if (LOG_LEVEL >= LOG_TRACE) {
         const static char m[] = "[TRACE] [kretprobe/sys_accept%s ]: new fd: %d [%x]";
         bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
     }
 
     if (fd < 0) {
-        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        if (LOG_LEVEL >= LOG_DEBUG) {
             const static char m[] = "[DEBUG] [kretprobe/sys_accept%s ]: failed to establish connection. Return code: %d [%x]";
             bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
         }
@@ -498,7 +521,7 @@ static int exit_accept(int fd, int is_accept4) {
         delete_trace();
 
     } else {
-        if (DEBUG_LEVEL >= LOG_LEVEL_INFO) {
+        if (LOG_LEVEL >= LOG_INFO) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[INFO ] [kretprobe/sys_accept%s ]: connection established for PID %d and FD [%x].";
             bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", id, fd);
@@ -506,12 +529,12 @@ static int exit_accept(int fd, int is_accept4) {
         
         const long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CONNECTED);
 
-        if (DEBUG_LEVEL != LOG_DISABLED && retval !=0) {
+        if (LOG_LEVEL != LOG_DISABLED && retval !=0) {
             if (retval == 1) {
-                printk(LOG_LEVEL_TRACE, "kretprobe/sys_accept", "[update_trace_flags] trace is NULL");
+                printk(LOG_TRACE, "kretprobe/sys_accept", "[update_trace_flags] trace is NULL");
             } else if (retval == 2) {
-                printk(LOG_LEVEL_ERROR, "kretprobe/sys_accept", "[update_trace_flags] unsupported operation");
-            } else if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+                printk(LOG_ERROR, "kretprobe/sys_accept", "[update_trace_flags] unsupported operation");
+            } else if (LOG_LEVEL >= LOG_DEBUG) {
                 const static char m[] = "[DEBUG] [kretprobe/sys_accept%s ]: [update_trace_flags] bpf_map_update: %d";
                 bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", retval);
             }
@@ -524,12 +547,12 @@ static int exit_accept(int fd, int is_accept4) {
 
 static int entry_rw(int fd, int rw) {
     const long retval = update_trace_fd(fd);
-    if (DEBUG_LEVEL != LOG_DISABLED) {
+    if (LOG_LEVEL != LOG_DISABLED) {
         const char c;
         bpf_get_current_comm((void*) &c, 6);
         if ((bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
             const static char m0[] = "[INFO ] [%-22s]: [update_trace_fd] trace was updated sucessfully. New FD: [%x].";
-            const static char m1[] = "[TRACE] [%-22s]: [update_trace_fd] no need to update trace - FD is identical [%x].";
+            const static char m1[] = "[TRALL] [%-22s]: [update_trace_fd] no need to update trace - FD is identical [%x].";
             const static char md[] = "[ERROR] [%-22s]: [update_trace_fd] invalid return value: %d.";
 
             char* origin = rw == READ_OP ? "kprobe/sys_read" : "kprobe/sys_write";
@@ -537,22 +560,22 @@ static int entry_rw(int fd, int rw) {
             switch (retval)
             {
             case 0:
-                if (DEBUG_LEVEL >= LOG_LEVEL_INFO) bpf_trace_printk(m0, sizeof(m0), origin, fd);
+                if (LOG_LEVEL >= LOG_INFO) bpf_trace_printk(m0, sizeof(m0), origin, fd);
                 break;
             case 1:
-                if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) bpf_trace_printk(m1, sizeof(m1), origin, fd);
+                if (LOG_LEVEL >= LOG_TRACE_ALL) bpf_trace_printk(m1, sizeof(m1), origin, fd);
                 break;
             case 2:
-                printk(LOG_LEVEL_TRACE, origin, "[update_trace_fd] trace is NULL.");
+                printk(LOG_TRACE_ALL, origin, "[update_trace_fd] trace is NULL.");
                 break;
             case 3:
-                printk(LOG_LEVEL_TRACE, origin, "[update_trace_fd] trace is CLOSED.");
+                printk(LOG_TRACE, origin, "[update_trace_fd] trace is CLOSED.");
                 break;
             case 4:
-                printk(LOG_LEVEL_TRACE, origin, "[update_trace_fd] trace is NOT connected.");
+                printk(LOG_TRACE, origin, "[update_trace_fd] trace is NOT connected.");
                 break;
             default:
-                if (DEBUG_LEVEL >= LOG_LEVEL_ERROR) bpf_trace_printk(md, sizeof(md), origin, retval);
+                if (LOG_LEVEL >= LOG_ERROR) bpf_trace_printk(md, sizeof(md), origin, retval);
                 break;
             }    
         }
@@ -582,7 +605,7 @@ static int entry_rw(int fd, int rw) {
 //  */
 // SEC("kprobe/sys_connect")
 // int BPF_KPROBE(entry_sys_connect, int sockfd, void* serv_addr, int addrlen) {
-//     if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+//     if (LOG_LEVEL >= LOG_TRACE) {
 //         const static char m[] = "[TRACE] [kprobe/sys_connect    ]: attempting connection with sockfd: %d [%x]";
 //         bpf_trace_printk(m, sizeof(m), sockfd, sockfd);
 //     }
@@ -595,7 +618,7 @@ static int entry_rw(int fd, int rw) {
 // SEC("kretprobe/sys_connect")
 // int BPF_KRETPROBE(ret_sys_connect, int rc) {
 //     if (rc < 0) {
-//         if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+//         if (LOG_LEVEL >= LOG_TRACE) {
 //             const static char m[] = "[TRACE] [kretprobe/sys_connect ]: not connected: %d";
 //             bpf_trace_printk(m, sizeof(m), rc);
 //         }
@@ -603,15 +626,15 @@ static int entry_rw(int fd, int rw) {
 //         delete_trace();
 
 //     } else {
-//         printk(LOG_LEVEL_TRACE, "kretprobe/sys_connect", "connected!");
+//         printk(LOG_TRACE, "kretprobe/sys_connect", "connected!");
 
 //         long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CONNECTED);
 
-//         if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG && retval !=0) {
+//         if (LOG_LEVEL >= LOG_DEBUG && retval !=0) {
 //             if (retval == 1) {
-//                 printk(LOG_LEVEL_DEBUG, "kretprobe/sys_connect", "trace is NULL");
+//                 printk(LOG_DEBUG, "kretprobe/sys_connect", "trace is NULL");
 //             } else if (retval == 2) {
-//                 printk(LOG_LEVEL_DEBUG, "kretprobe/sys_connect", "unsupported operation");
+//                 printk(LOG_DEBUG, "kretprobe/sys_connect", "unsupported operation");
 //             } else {
 //                 const static char m[] = "[DEBUG] [kretprobe/sys_connect] bpf_map_update: %d";
 //                 bpf_trace_printk(m, sizeof(m), retval);
@@ -698,47 +721,31 @@ int BPF_KPROBE(entry_sys_write, int fd, void* buf, int num) {
  * sys_close
  * Function signature: int close(int fd);
  * Description: closes a file descriptor, so that it no longer
- *              refers to any file and may be reused. 
+ *              refers to any file and may be reused.
  */
-SEC("kprobe/sys_close")
-int BPF_KPROBE(entry_sys_close, int fd) {
-    const long retval = update_trace_fd(fd); // not necessary. This is only here to make the verifier happy enough to print logs.
-    if (DEBUG_LEVEL >= LOG_DISABLED) {
-        const char c;
-        bpf_get_current_comm((void*) &c, 6);
-        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE && (bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
-            const u64 id = bpf_get_current_pid_tgid();
-            const static char m[] = "[TRACE] [kprobe/sys_close      ] : id: %d, fd: [%x]";
-            bpf_trace_printk(m, sizeof(m), id, fd);
-        }
-    }
 
-    return 0;
-}
+// SEC("kretprobe/sys_close")
+// int BPF_KRETPROBE(ret_sys_close, int rc) {
+//     const long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CLOSED);
+//     if (LOG_LEVEL != LOG_DISABLED) {
+//         const char c;
+//         bpf_get_current_comm((void*) &c, 6);
+//         if ((retval != 0) && (bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
+//             if (retval == 1) {
+//                 printk(LOG_TRACE_ALL, "kretprobe/sys_close", "[update_trace_flags] trace is NULL");
+//             } else if (LOG_LEVEL >= LOG_DEBUG) {
+//                 const static char m[] = "[DEBUG] [kretprobe/sys_close   ]: [update_trace_flags] bpf_map_update: %d";
+//                 bpf_trace_printk(m, sizeof(m), retval);
+//             }
+//         }
 
-SEC("kretprobe/sys_close")
-int BPF_KRETPROBE(ret_sys_close, int rc) {
-    const long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CLOSED);
-    if (DEBUG_LEVEL != LOG_DISABLED) {
-        const char c;
-        bpf_get_current_comm((void*) &c, 6);
-        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE && (bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
-            const static char m[] = "[TRACE] [kretprobe/sys_close   ] : rc: %d";
-            bpf_trace_printk(m, sizeof(m), rc);
-        }
+//         if (retval == 2) {
+//             printk(LOG_ERROR, "kretprobe/sys_close", "[update_trace_flags] unsupported operation");
+//         }
+//     }
 
-        if (retval == 1) {
-            printk(LOG_LEVEL_DEBUG, "kretprobe/sys_close", "[update_trace_flags] trace is NULL");
-        } else if (retval == 2) {
-            printk(LOG_LEVEL_ERROR, "kretprobe/sys_close", "[update_trace_flags] unsupported operation");
-        } else if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG && retval !=0) {
-            const static char m[] = "[DEBUG] [kretprobe/sys_close   ]: [update_trace_flags] bpf_map_update: %d";
-            bpf_trace_printk(m, sizeof(m), retval);
-        }
-    }
-
-    return rc;
-}
+//     return rc;
+// }
 
 
 
@@ -750,14 +757,14 @@ int BPF_KRETPROBE(ret_sys_close, int rc) {
 
 SEC("uprobe/SSL_connect")
 int BPF_UPROBE(entry_ssl_connect, void* ssl) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+    if (LOG_LEVEL >= LOG_TRACE) {
         const u64 id = bpf_get_current_pid_tgid();
         const static char m[] = "[TRACE] [uprobe/SSL_connect    ]: attempting to establish a connection for PID %d.";
         bpf_trace_printk(m, sizeof(m), id);
     }
 
     if (init_trace(INVALID_FD, 1) == 0) {
-        printk(LOG_LEVEL_DEBUG, "uprobe/SSL_connect", "trace initialized successfully.");
+        printk(LOG_DEBUG, "uprobe/SSL_connect", "trace initialized successfully.");
     }
 
     return 0;
@@ -767,7 +774,7 @@ SEC("uretprobe/SSL_connect")
 int BPF_URETPROBE(ret_ssl_connect) {
     int rc = PT_REGS_RC(ctx);
     if (rc == 1) {
-        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        if (LOG_LEVEL >= LOG_DEBUG) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[DEBUG] [uretprobe/SSL_connect ]: connection established for PID %d.";
             bpf_trace_printk(m, sizeof(m), id);
@@ -776,14 +783,14 @@ int BPF_URETPROBE(ret_ssl_connect) {
         update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CONNECTED);
 
     } else {
-        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+        if (LOG_LEVEL >= LOG_TRACE) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[TRACE] [uretprobe/SSL_connect ]: failed to establish connection for PID %d. Return code: %d";
             bpf_trace_printk(m, sizeof(m), id, rc);
         }
 
         if (delete_trace() == 0) {
-            printk(LOG_LEVEL_DEBUG, "uretprobe/SSL_connect", "trace deleted successfully.");
+            printk(LOG_DEBUG, "uretprobe/SSL_connect", "trace deleted successfully.");
         }
     }
 
@@ -792,14 +799,14 @@ int BPF_URETPROBE(ret_ssl_connect) {
 
 SEC("uprobe/SSL_accept")
 int BPF_UPROBE(entry_ssl_accept, void* ssl) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+    if (LOG_LEVEL >= LOG_TRACE) {
         const u64 id = bpf_get_current_pid_tgid();
         const static char m[] = "[TRACE] [uprobe/SSL_accept     ] : waiting for TLS/SSL handshake for PID %d.";
         bpf_trace_printk(m, sizeof(m), id);
     }
 
     if (init_trace(INVALID_FD, 1) == 0) {
-        printk(LOG_LEVEL_DEBUG, "uprobe/SSL_accept", "trace initialized successfully.");
+        printk(LOG_DEBUG, "uprobe/SSL_accept", "trace initialized successfully.");
     }
 
     return 0;
@@ -809,7 +816,7 @@ SEC("uretprobe/SSL_accept")
 int BPF_URETPROBE(ret_ssl_accept) {
     int rc = PT_REGS_RC(ctx);
     if (rc == 1) {
-        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        if (LOG_LEVEL >= LOG_DEBUG) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[DEBUG] [uretprobe/SSL_accept  ]: TLS/SSL handshake successfully completed for PID %d.";
             bpf_trace_printk(m, sizeof(m), id);
@@ -818,14 +825,14 @@ int BPF_URETPROBE(ret_ssl_accept) {
         update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CONNECTED);
 
     } else {
-        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+        if (LOG_LEVEL >= LOG_TRACE) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[TRACE] [uretprobe/SSL_accept  ]: failed to perform a TLS/SSL handshake for PID %d. Return code: %d";
             bpf_trace_printk(m, sizeof(m), id, rc);
         }
 
         if (delete_trace() == 0) {
-            printk(LOG_LEVEL_DEBUG, "uretprobe/SSL_accept", "trace deleted successfully.");
+            printk(LOG_DEBUG, "uretprobe/SSL_accept", "trace deleted successfully.");
         }
     }
 
@@ -834,7 +841,7 @@ int BPF_URETPROBE(ret_ssl_accept) {
 
 SEC("uprobe/SSL_shutdown")
 int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+    if (LOG_LEVEL >= LOG_TRACE) {
         const u64 id = bpf_get_current_pid_tgid();
         const static char m[] = "[TRACE] [uprobe/SSL_shutdown   ]: attempting to shutdown an active TLS/SSL connection for PID %d.";
         bpf_trace_printk(m, sizeof(m), id);
@@ -849,7 +856,7 @@ SEC("uretprobe/SSL_shutdown")
 int BPF_URETPROBE(ret_ssl_shutdown) {
     int rc = PT_REGS_RC(ctx);
     if (rc == 1) {
-        if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+        if (LOG_LEVEL >= LOG_DEBUG) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[DEBUG] [uretprobe/SSL_shutdown]: TLS/SSL shutdown completed successfully for PID %d.";
             bpf_trace_printk(m, sizeof(m), id);
@@ -858,7 +865,7 @@ int BPF_URETPROBE(ret_ssl_shutdown) {
         update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
 
     } else {
-        if (DEBUG_LEVEL >= LOG_LEVEL_TRACE) {
+        if (LOG_LEVEL >= LOG_TRACE) {
             const u64 id = bpf_get_current_pid_tgid();
             const static char m[] = "[TRACE] [uretprobe/SSL_shutdown]: failed to shutdown TLS/SSL connection for PID %d. Return code: %d";
             bpf_trace_printk(m, sizeof(m), id, rc);
@@ -870,7 +877,7 @@ int BPF_URETPROBE(ret_ssl_shutdown) {
 
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [uprobe/SSL_read       ]: will attempt to read from buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
@@ -879,7 +886,7 @@ int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [uprobe/SSL_write      ]: will attempt to write to buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
@@ -888,7 +895,7 @@ int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
 
 SEC("uretprobe/SSL_read")
 int BPF_URETPROBE(ret_ssl_read, int n) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [uretprobe/SSL_read    ]: read %d bytes!";
         if (n > 0) {
             bpf_trace_printk(m, sizeof(m), n);
@@ -899,14 +906,14 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
 
     if (n <= 0 && is_set(TRACE_SSL_AJAR, NULL)) {
         update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
-        printk(LOG_LEVEL_DEBUG, "uretprobe/SSL_read", "trace is now SSL closed");
+        printk(LOG_DEBUG, "uretprobe/SSL_read", "trace is now SSL closed");
     }
     return (SSL_exit(ctx, READ_OP));
 }
 
 SEC("uretprobe/SSL_write")
 int BPF_URETPROBE(ret_ssl_write, int n) {
-    if (DEBUG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_DEBUG) {
         const static char m[] = "[DEBUG] [uretprobe/SSL_write   ]: wrote %d bytes!";
         if (n > 0) {
             bpf_trace_printk(m, sizeof(m), n);
@@ -917,7 +924,7 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
 
     if (n <= 0 && is_set(TRACE_SSL_AJAR, NULL)) {
         update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
-        printk(LOG_LEVEL_DEBUG, "uretprobe/SSL_write", "trace is now SSL closed");
+        printk(LOG_DEBUG, "uretprobe/SSL_write", "trace is now SSL closed");
     }
     return (SSL_exit(ctx, WRITE_OP));
 }
