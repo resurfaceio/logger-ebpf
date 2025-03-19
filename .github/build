@@ -2,7 +2,7 @@
 
 set -e
 
-apt install clang git libbpf-dev make
+apt update && apt upgrade -y && apt install clang git libbpf-dev make
 ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
 make headers
 make build
