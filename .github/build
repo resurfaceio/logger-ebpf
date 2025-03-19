@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -e
+
+cwd=$(pwd)
+apt install clang git libbpf-dev make wget tar
+cd /opt && wget https://go.dev/dl/go1.22.6.linux-amd64.tar.gz && tar -xzf go1.22.6.linux-amd64.tar.gz
+ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
+cd $cwd
+make headers
+make build
