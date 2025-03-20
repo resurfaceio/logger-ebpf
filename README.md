@@ -1,6 +1,7 @@
 # resurfaceio-logger-ebpf
 Easily log **encrypted** API requests and responses to your own <a href="https://resurface.io">security data lake</a>.
 
+[![CodeFactor](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf/badge?s=1edfaf41d674519709d3abb9c1836e84b4c3a20f)](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf)
 [![License](https://img.shields.io/github/license/resurfaceio/logger-ebpf)](https://github.com/resurfaceio/logger-ebpf/blob/master/LICENSE)
 [![Contributing](https://img.shields.io/badge/contributions-welcome-green.svg)](https://github.com/resurfaceio/logger-ebpf/blob/master/CONTRIBUTING.md)
 
