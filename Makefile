@@ -29,4 +29,4 @@ dotenv:
 	cp --update=none .env.example .env
 clean:
 	sed -i '3s/go:/x86_64:/;5s/go:/aarch64:/' gen.go
-	rm -f ebpf-logger* logger_bpfel.go logger_bpfeb.go logger_bpfeb.o logger_bpfel.o logger_x86_bpfel.go logger_x86_bpfel.o logger_arm64_bpfel.go logger_arm64_bpfel.o
+	rm -f ebpf-logger* logger_*.go logger_*.o

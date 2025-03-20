@@ -2,18 +2,16 @@
 
 ## Configuring Development Environment
 
-Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit).
+Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit) or ARM64 (64-bit)
 
-⚠️ ARM and Apple Silicon are not supported or recommended yet* (see notes)
-
-Install required Go version:
+Install required Go version (1.24.0):
 ```bash
 cd /opt
-wget https://go.dev/dl/go1.22.6.linux-amd64.tar.gz
-tar -xzf go1.22.6.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
+tar -xzf go1.24.0.linux-amd64.tar.gz
 export PATH="/opt/go/bin:$PATH"
 go version
-👆 should be 1.22.6
+👆 should be 1.24.0
 ```
 
 Install required packages:
@@ -34,7 +32,6 @@ sudo ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
 cd $HOME
 git clone https://github.com/resurfaceio/logger-ebpf.git
 cd logger-ebpf
-git checkout openssl-ringbuf
 make headers
 make dotenv
 ```
@@ -55,18 +52,4 @@ The values can be modified by updating the `.env` file generated with `make dote
 
 ```bash
 make build run
-```
-
-------
-## ARM Notes
-
-We are still trying to figure out portability. In the meantime, we need to specify a `-target` architecture in `gen.go`, as well as the correct path to any executables in `main.go`. Currently, these are the only two changes required for the logger to work on arm64. However, development is being carried out on amd64 and there are no immediate plans to support arm.
-
-Having said that, if you really wanna try your luck with ARM, do this before:
-
-```
-mkdir backups
-mv gen.go main.go backups/
-sed 's/amd64/arm64/g;s/x86_64/aarch64/g' backups/gen.go > gen.go
-sed 's/x86_64/aarch64/g' backups/main.go > main.go
 ```
