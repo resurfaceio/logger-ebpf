@@ -1,0 +1,7 @@
+# action.yml
+name: 'logger-builder'
+description: 'Builds ebpg-logger binary'
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+

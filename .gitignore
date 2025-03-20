@@ -29,6 +29,6 @@ k8s/
 .env
 
 # docker
-Dockerfile*
-Containerfile*
-.dockerignore
+/Dockerfile*
+/Containerfile*
+/.dockerignore
