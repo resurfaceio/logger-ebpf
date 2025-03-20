@@ -12,5 +12,5 @@ No outputs produced.
 
 ## Example usage
 
-uses: actions/logger-builder-action@v1
+uses: logger-ebpf/logger-builder@v1
 
