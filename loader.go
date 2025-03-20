@@ -80,43 +80,7 @@ func load(exPath string, isClient bool) []closer {
 			log.Panicln("Attaching kretprobe:", err)
 		}
 		closers = append(closers, kretAccept4)
-	} else {
-		// kConnect, err := link.Kprobe("sys_connect", objs.EntrySysConnect, nil)
-		// if err != nil {
-		// 	log.Panicln("Attaching kprobe:", err)
-		// }
-		// closers = append(closers, kConnect)
-
-		// kretConnect, err := link.Kretprobe("sys_connect", objs.RetSysConnect, nil)
-		// if err != nil {
-		// 	log.Panicln("Attaching kprobe:", err)
-		// }
-		// closers = append(closers, kretConnect)
 	}
-
-	// kRead, err := link.Kprobe("sys_read", objs.EntrySysRead, nil)
-	// if err != nil {
-	// 	log.Panicln("Attaching kprobe:", err)
-	// }
-	// closers = append(closers, kRead)
-
-	// kWrite, err := link.Kprobe("sys_write", objs.EntrySysWrite, nil)
-	// if err != nil {
-	// 	log.Panicln("Attaching kprobe:", err)
-	// }
-	// closers = append(closers, kWrite)
-
-	// kClose, err := link.Kprobe("sys_close", objs.EntrySysClose, nil)
-	// if err != nil {
-	// 	log.Panicln("Attaching kprobe:", err)
-	// }
-	// closers = append(closers, kClose)
-
-	// kretClose, err := link.Kretprobe("sys_close", objs.RetSysClose, nil)
-	// if err != nil {
-	// 	log.Panicln("Attaching kprobe:", err)
-	// }
-	// closers = append(closers, kretClose)
 
 	//---------------------------------------------------------
 

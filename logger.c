@@ -388,11 +388,6 @@ static long update_trace_flags(int operation, u32 operand) {
 static int SSL_entry(void *buf, int rw) {
     u64 id = bpf_get_current_pid_tgid();
 
-    // TODO ? - make map for stashes instead of having only one
-    //          data structure to stash reads, and one to stash writes.
-    //          Is it necessary? Should there be multiple stashes? For async access? What about race conditions?
-    // buf_stash.id = id;
-
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace == NULL) {
         printk(LOG_TRACE, "SSL_entry", "trace is NULL");
@@ -539,8 +534,6 @@ static int exit_accept(int fd, int is_accept4) {
                 bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", retval);
             }
         }
-
-        // TODO ? - trace fd further? in order to match with bio->num using openssl offsets (1.x)
     }
     return 0;
 }
@@ -590,60 +583,10 @@ static int entry_rw(int fd, int rw) {
  * 
  */
 
-// /**
-//  * 
-//  * Initialize trace id with fd retrieved from the following syscalls:
-//  * - sys_connect (client)
-//  * - sys_accept/sys_accept4 (server)
-//  */
-
-// /**
-//  * sys_connect
-//  * Function signature: int connect(int sockfd, void* addr, int addrlen);
-//  * Description: The connect() system call connects the socket referred to
-//  *              by the file descriptor sockfd to the address specified by addr.
-//  */
-// SEC("kprobe/sys_connect")
-// int BPF_KPROBE(entry_sys_connect, int sockfd, void* serv_addr, int addrlen) {
-//     if (LOG_LEVEL >= LOG_TRACE) {
-//         const static char m[] = "[TRACE] [kprobe/sys_connect    ]: attempting connection with sockfd: %d [%x]";
-//         bpf_trace_printk(m, sizeof(m), sockfd, sockfd);
-//     }
-
-//     init_trace(sockfd);
-
-//     return 0;
-// }
-
-// SEC("kretprobe/sys_connect")
-// int BPF_KRETPROBE(ret_sys_connect, int rc) {
-//     if (rc < 0) {
-//         if (LOG_LEVEL >= LOG_TRACE) {
-//             const static char m[] = "[TRACE] [kretprobe/sys_connect ]: not connected: %d";
-//             bpf_trace_printk(m, sizeof(m), rc);
-//         }
-
-//         delete_trace();
-
-//     } else {
-//         printk(LOG_TRACE, "kretprobe/sys_connect", "connected!");
-
-//         long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CONNECTED);
-
-//         if (LOG_LEVEL >= LOG_DEBUG && retval !=0) {
-//             if (retval == 1) {
-//                 printk(LOG_DEBUG, "kretprobe/sys_connect", "trace is NULL");
-//             } else if (retval == 2) {
-//                 printk(LOG_DEBUG, "kretprobe/sys_connect", "unsupported operation");
-//             } else {
-//                 const static char m[] = "[DEBUG] [kretprobe/sys_connect] bpf_map_update: %d";
-//                 bpf_trace_printk(m, sizeof(m), retval);
-//             }
-//         }
-//     }
-
-//     return 0;
-// }
+/**
+ * 
+ * Initialize trace id with fd retrieved from sys_accept/sys_accept4 calls (server mode)
+ */
 
 /**
  * sys_accept
@@ -684,69 +627,6 @@ SEC("kretprobe/sys_accept4")
 int BPF_KRETPROBE(ret_sys_accept4, int fd) {
     return exit_accept(fd, 1);
 }
-
-/**
- * 
- * Update trace id with fd retrieved from the following syscalls:
- * - sys_read
- * - sys_write
- */
-
-/**
- * sys_read
- * Function signature: int read(int fd, void* buf, int num);
- * Description: Reads num bytes in buf from file descriptor fd.
- */
-SEC("kprobe/sys_read")
-int BPF_KPROBE(entry_sys_read, int fd, void* buf, int num) {
-    return entry_rw(fd, READ_OP);
-}
-
-/**
- * sys_read
- * Function signature: int write(int fd, void* buf, int num);
- * Description: Writes num bytes from buf to file descriptor fd.
- */
-SEC("kprobe/sys_write")
-int BPF_KPROBE(entry_sys_write, int fd, void* buf, int num) {
-    return entry_rw(fd, WRITE_OP);
-}
-
-/**
- * 
- * Mark message as closed with fd retrieved from the sys_close syscall.
- */
-
-/**
- * sys_close
- * Function signature: int close(int fd);
- * Description: closes a file descriptor, so that it no longer
- *              refers to any file and may be reused.
- */
-
-// SEC("kretprobe/sys_close")
-// int BPF_KRETPROBE(ret_sys_close, int rc) {
-//     const long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CLOSED);
-//     if (LOG_LEVEL != LOG_DISABLED) {
-//         const char c;
-//         bpf_get_current_comm((void*) &c, 6);
-//         if ((retval != 0) && (bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
-//             if (retval == 1) {
-//                 printk(LOG_TRACE_ALL, "kretprobe/sys_close", "[update_trace_flags] trace is NULL");
-//             } else if (LOG_LEVEL >= LOG_DEBUG) {
-//                 const static char m[] = "[DEBUG] [kretprobe/sys_close   ]: [update_trace_flags] bpf_map_update: %d";
-//                 bpf_trace_printk(m, sizeof(m), retval);
-//             }
-//         }
-
-//         if (retval == 2) {
-//             printk(LOG_ERROR, "kretprobe/sys_close", "[update_trace_flags] unsupported operation");
-//         }
-//     }
-
-//     return rc;
-// }
-
 
 
 /**

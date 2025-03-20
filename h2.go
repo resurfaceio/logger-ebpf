@@ -30,7 +30,6 @@ type h2frame struct {
 }
 
 func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
-	//log.Println("offset: ", offset)
 	if offset+3 > len(barray) {
 		nextIndex = -1
 		frame._empty = true
@@ -41,7 +40,6 @@ func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 	tmp := make([]byte, 4)
 	copy(tmp[1:], frame._len[:])
 	frame._lend = binary.BigEndian.Uint32(tmp)
-	//log.Println("lend: ", frame._lend)
 
 	nextIndex = 9 + offset + int(frame._lend)
 	if nextIndex > len(barray) {
@@ -51,10 +49,6 @@ func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 	}
 
 	frame._type = barray[3+offset]
-
-	if frame._type == SETTINGS {
-		// nothing
-	}
 
 	frame._flag = barray[4+offset]
 
@@ -78,7 +72,6 @@ func toh2frame(barray []byte, offset int) (frame h2frame, nextIndex int) {
 func toFrames(frameBytes []byte) (frames []h2frame) {
 	var frame h2frame
 	var offset int = 0
-	// for {
 	for offset < len(frameBytes) {
 		frame, offset = toh2frame(frameBytes, offset)
 		if offset == -1 {
