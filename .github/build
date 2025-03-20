@@ -1,8 +1,0 @@
-#!/bin/bash
-
-set -e
-
-apt update && apt upgrade -y && apt install -y clang make libbpf-dev bpftool
-ln -s /usr/bin/llvm-strip-14 /usr/bin/llvm-strip
-make headers nosudo=1
-make build
