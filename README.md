@@ -1,5 +1,5 @@
 # resurfaceio-logger-ebpf
-Easily log API requests and responses to your own <a href="https://resurface.io">security data lake</a>.
+Easily log **encrypted** API requests and responses to your own <a href="https://resurface.io">security data lake</a>.
 
 [![License](https://img.shields.io/github/license/resurfaceio/logger-ebpf)](https://github.com/resurfaceio/logger-ebpf/blob/master/LICENSE)
 [![Contributing](https://img.shields.io/badge/contributions-welcome-green.svg)](https://github.com/resurfaceio/logger-ebpf/blob/master/CONTRIBUTING.md)
@@ -10,7 +10,7 @@ Easily log API requests and responses to your own <a href="https://resurface.io"
 <ul>
 <li><a href="#dependencies">Dependencies</a></li>
 <li><a href="#usage">Usage</a></li>
-<li><a href="#logging-from-container">Capturing traffic from containerized application</a></li>
+<li><a href="#logging-from-container">Capturing traffic from a containerized application</a></li>
 <li><a href="#build-from-source">Building from source</a></li>
 <li><a href="#privacy">Protecting User Privacy</a></li>
 </ul>
@@ -52,7 +52,7 @@ ldconfig -p | grep ssl
 The environment variable `USAGE_LOGGERS_RULES` stores these [logging rules](#protecting-user-privacy) as a string. Even though this variable is optional, it is recommended to set it to `"include debug"` or `"allow_http_url"` when trying the plugin for the first time.
 #### ✔ The Logger can capture calls in client mode (Optional)
 You can set the environment variable `USAGE_LOGGERS_EBPF_ROLE` to `"client"` for the logger to capture API calls made from a client application (e.g. cURL).
-#### ✔ The Logger can be disabled even if the plugin is enabled (Optional)
+#### ✔ The Logger can be disabled at any time (Optional)
 By setting the environment variable `USAGE_LOGGERS_DISABLE` to `true` the logger will be disabled and no API calls will be logged.
 
 
