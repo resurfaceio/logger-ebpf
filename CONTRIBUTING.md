@@ -11,7 +11,7 @@ wget https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
 tar -xzf go1.24.0.linux-amd64.tar.gz
 export PATH="/opt/go/bin:$PATH"
 go version
-👆 should be 1.24.0
+# 👆 should be 1.24.0
 ```
 
 Install required packages:
