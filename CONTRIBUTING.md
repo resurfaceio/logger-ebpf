@@ -6,9 +6,11 @@ Start with latest Ubuntu Noble (24.04.1 or later) on Intel x86 (64-bit) or ARM64
 
 Install required Go version (1.24.0):
 ```bash
+arch=$(dpkg --print-architecture)
 cd /opt
-wget https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
-tar -xzf go1.24.0.linux-amd64.tar.gz
+sudo wget https://go.dev/dl/go1.24.0.linux-$arch.tar.gz
+sudo tar -xzf go1.24.0.linux-$arch.tar.gz
+sudo rm go1.24.0.linux-$arch.tar.gz
 export PATH="/opt/go/bin:$PATH"
 go version
 # 👆 should be 1.24.0
@@ -16,7 +18,7 @@ go version
 
 Install required packages:
 ```bash
-sudo apt install clang git libbpf-dev make
+sudo apt install clang libbpf-dev make git
 ```
 
 Add required soft link:
@@ -28,11 +30,23 @@ sudo ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
 
 ### Set up environment
 
+Clone the repo
+
 ```bash
 cd $HOME
 git clone https://github.com/resurfaceio/logger-ebpf.git
+```
+
+Make headers
+
+```
 cd logger-ebpf
 make headers
+```
+
+Make .env file (only if running with `make run`)
+
+```
 make dotenv
 ```
 
