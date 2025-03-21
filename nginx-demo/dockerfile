@@ -1,0 +1,21 @@
+FROM nginx:latest
+
+# configure tls and add two simple endpoints: /[index.html] and /json
+COPY ./nginx-demo/nginx.conf /etc/nginx/nginx.conf
+RUN mkdir /etc/nginx/tls /etc/nginx/www
+RUN echo '{"hello": "world"}' > /etc/nginx/www/json
+COPY ./nginx-demo/index.html /etc/nginx/www/index.html
+RUN openssl req -x509 -newkey rsa:4096 -keyout /etc/nginx/tls/nginx.key -out /etc/nginx/tls/nginx.crt -sha256 -days 365 -nodes -subj "/C=US/ST=Texas/L=Houston/O=Graylog/OU=APISecurity/CN=neptune"
+
+# configure logger-ebpf
+ENV USAGE_LOGGERS_URL="http://172.17.0.1:7701/message"
+ENV USAGE_LOGGERS_RULES="include debug"
+ENV USAGE_LOGGERS_EBPF_ROLE="server"
+ENV USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3"
+RUN mkdir /var/log/graylog_ebpf_logger && touch /var/log/graylog_ebpf_logger/out.log /var/log/graylog_ebpf_logger/err.log
+COPY --chmod=755 ./ebpf-logger /usr/sbin/ebpf-logger
+COPY --chmod=755 ./nginx-demo/entrypoint.sh /new-entrypoint.sh
+
+# run ebpf-logger in the background and call entrypoint and cmd as usual (see entrypoint.sh)
+ENTRYPOINT [ "/new-entrypoint.sh" ]
+CMD [ "nginx", "-g", "daemon off;" ]

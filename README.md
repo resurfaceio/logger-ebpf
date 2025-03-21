@@ -84,11 +84,28 @@ docker exec -it -u root mycontainer sh
 You can use your existing container images to build a new one that contains our binary:
 
 ```dockerfile
-FROM myimage:mytag
+FROM yourapp:itstag
 
-COPY ./ebpf-logger /
-RUN //TODO make daemon
+ENV USAGE_LOGGERS_URL="http://172.17.0.1:7701/message"
+ENV USAGE_LOGGERS_RULES="include debug"
+ENV USAGE_LOGGERS_EBPF_ROLE="server"
+ENV USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3"
+
+COPY --chmod=755 ./ebpf-logger /usr/sbin/ebpf-logger
+RUN mkdir /var/log/graylog_ebpf_logger && touch /var/log/graylog_ebpf_logger/out.log /var/log/graylog_ebpf_logger/err.log
+ENTRYPOINT [ "/new-entrypoint.sh" ]
 ```
+
+With `new-entrypoint.sh` following this pattern:
+
+```
+#!/bin/sh
+
+ebpf-logger >> /var/log/graylog_ebpf_logger/out.log 2>> /var/log/graylog_ebpf_logger/err.log &
+# call your usual entrypoint.sh from here
+```
+
+Please, see `nginx-demo/README.md` and try it yourself!
 
 <a name="build-from-source"></a>
 
