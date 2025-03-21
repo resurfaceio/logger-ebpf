@@ -34,7 +34,7 @@ Clone the repo
 
 ```bash
 cd $HOME
-git clone https://github.com/resurfaceio/logger-ebpf.git
+git clone git@github.com:resurfaceio/logger-ebpf.git
 ```
 
 Make headers
