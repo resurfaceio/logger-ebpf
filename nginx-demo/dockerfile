@@ -1,11 +1,12 @@
 FROM nginx:latest
 
-# configure tls and add two simple endpoints: /[index.html] and /json
+# configure self-signed certificate and add two simple endpoints: /[index.html] and /json
+ARG hostname=localhost
 COPY ./nginx-demo/nginx.conf /etc/nginx/nginx.conf
 RUN mkdir /etc/nginx/tls /etc/nginx/www
 RUN echo '{"hello": "world"}' > /etc/nginx/www/json
 COPY ./nginx-demo/index.html /etc/nginx/www/index.html
-RUN openssl req -x509 -newkey rsa:4096 -keyout /etc/nginx/tls/nginx.key -out /etc/nginx/tls/nginx.crt -sha256 -days 365 -nodes -subj "/C=US/ST=Texas/L=Houston/O=Graylog/OU=APISecurity/CN=neptune"
+RUN openssl req -x509 -newkey rsa:4096 -keyout /etc/nginx/tls/nginx.key -out /etc/nginx/tls/nginx.crt -sha256 -days 365 -nodes -subj "/C=US/ST=Texas/L=Houston/O=Graylog/OU=APISecurity/CN=${hostname}"
 
 # configure logger-ebpf
 ENV USAGE_LOGGERS_URL="http://172.17.0.1:7701/message"

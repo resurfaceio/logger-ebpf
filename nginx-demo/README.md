@@ -4,10 +4,10 @@
 
 ### Setup
 
-Add `neptune` to your `/etc/hosts`
+Add `mydemo` to your `/etc/hosts`
 
 ```sh
-echo 127.0.0.1 neptune >> /etc/hosts
+echo 127.0.0.1 mydemo >> /etc/hosts
 ```
 
 Run **Graylog API Security**
@@ -28,7 +28,7 @@ make build
 Build the image
 
 ```sh
-docker build -t ebpf-logger-nginx:latest -f nginx-demo/dockerfile .
+docker build -t ebpf-logger-nginx:latest --build-arg hostname=mydemo -f nginx-demo/dockerfile .
 ```
 
 ### Run the thing!
