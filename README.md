@@ -105,7 +105,7 @@ ebpf-logger >> /var/log/graylog_ebpf_logger/out.log 2>> /var/log/graylog_ebpf_lo
 # call your usual entrypoint.sh from here
 ```
 
-Please, see `nginx-demo/README.md` and try it yourself!
+Please, see [nginx-demo](https://github.com/resurfaceio/logger-ebpf/blob/master/nginx-demo/README.md) and try it yourself!
 
 <a name="build-from-source"></a>
 
