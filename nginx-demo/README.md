@@ -4,25 +4,17 @@
 
 ### Setup
 
-Add `mydemo` to your `/etc/hosts`
-
-```sh
-echo 127.0.0.1 mydemo >> /etc/hosts
-```
-
 Run **Graylog API Security**
 
 ```sh
 docker run -v resurface:/db -d --name resurface -p 7700:7700 -p 7701:7701 --restart=always -e DB_HEAP=6g -e POLLING_CYCLE=fast -e TZ=America/Denver resurfaceio/resurface:3.7.84
 ```
 
-### Build
-
 Build the binary (or get a pre-built one from our [releases](https://github.com/resurfaceio/logger-ebpf/releases))
 
 ```sh
 cd ..
-make build
+make headers build
 ```
 
 Build the image
@@ -42,7 +34,7 @@ docker run -d --rm --name nginx-demo --privileged -p 8443:443 ebpf-logger-nginx:
 Make some calls to it
 
 ```sh
-curl -k https://mydemo:8443/json
+curl -k -H "Host: mydemo" https://mydemo:8443/json
 ```
 
 Go to http://localhost:7700/ and see your calls flowing in!
