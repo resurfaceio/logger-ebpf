@@ -89,7 +89,9 @@ FROM yourapp:itstag
 ENV USAGE_LOGGERS_URL="http://172.17.0.1:7701/message"
 ENV USAGE_LOGGERS_RULES="include debug"
 ENV USAGE_LOGGERS_EBPF_ROLE="server"
+# choose according to your CPU arch
 ENV USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3"
+#ENV USAGE_LOGGERS_EBPF_EXPATH="/lib/aarch64-linux-gnu/libssl.so.3"
 
 COPY --chmod=755 ./ebpf-logger /usr/sbin/ebpf-logger
 RUN mkdir /var/log/graylog_ebpf_logger && touch /var/log/graylog_ebpf_logger/out.log /var/log/graylog_ebpf_logger/err.log
