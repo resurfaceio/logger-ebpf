@@ -26,10 +26,6 @@ Add required soft link:
 sudo ln -s /usr/bin/llvm-strip-18 /usr/bin/llvm-strip
 ```
 
-## Running Locally
-
-### Set up environment
-
 Clone the repo
 
 ```bash
@@ -44,7 +40,11 @@ cd logger-ebpf
 make headers
 ```
 
-Make .env file (only if running with `make run`)
+## Running Locally in host
+
+### Set up environment
+
+Make .env file
 
 ```
 make dotenv
@@ -67,3 +67,7 @@ The values can be modified by updating the `.env` file generated with `make dote
 ```bash
 make build run
 ```
+
+## Running Locally in container
+
+See our [nginx-demo](https://github.com/resurfaceio/logger-ebpf/tree/master/nginx-demo)!
