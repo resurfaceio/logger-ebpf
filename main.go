@@ -526,13 +526,14 @@ func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
 		parsedUrl := &url.URL{}
 		reqHeaders := http.Header{}
 		respHeaders := http.Header{}
+		streamIds := make([][4]byte, 0, 5)
 
 		for i, raw := range [][]byte{message.rawReq, message.rawResp} {
 			label := "REQ"
 			if i != 0 {
 				label = "RESP"
 			}
-			for _, frame := range toFrames(raw) {
+			for _, frame := range toFrames(raw, &streamIds) {
 				if LOG_LEVEL >= TRACE {
 					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
 					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
