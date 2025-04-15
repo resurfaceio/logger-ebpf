@@ -291,9 +291,8 @@ func main() {
 }
 
 func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
-	var received ringbuf.Record
 	for {
-		if err := reader.ReadInto(&received); err != nil {
+		if received, err := reader.Read(); err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				if LOG_LEVEL >= INFO {
 					log.Printf("closing %s channel...\n", name)
@@ -305,8 +304,9 @@ func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
 				log.Printf("reading from %s reader: %s", name, err)
 			}
 			continue
+		} else {
+			*c <- received
 		}
-		*c <- received
 	}
 }
 
