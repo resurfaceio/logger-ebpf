@@ -551,7 +551,7 @@ func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
 				}
 
 				if frame._type == HEADERS {
-					decoder := hpack.NewDecoder(2048, nil)
+					decoder := hpack.NewDecoder(4096, nil)
 					headers, err := decoder.DecodeFull(frame._data)
 					if err != nil {
 						log.Println("decoding headers: ", err)
