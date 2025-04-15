@@ -35,7 +35,7 @@
 
 #define MAX_BYTES           1024
 #define INVALID_FD          MAX_U32_VALUE
-#define LOG_LEVEL           LOG_DEBUG
+#define LOG_LEVEL           LOG_TRACE
 
 /**
  * 
@@ -60,16 +60,6 @@ struct trace_t {
     u64 ts;
     uintptr_t readsbp;
     uintptr_t writesbp;
-};
-
-/**
- * Temporary buffer
- * Description: used to stash a reference to the buffer used by read/write syscalls.
- * [ id (32) | *buf (8?)]
- */
-struct data_buf_t {
-    u32 id;
-    const char* buf;
 };
 
 /**
@@ -535,45 +525,6 @@ static int exit_accept(int fd, int is_accept4) {
             }
         }
     }
-    return 0;
-}
-
-static int entry_rw(int fd, int rw) {
-    const long retval = update_trace_fd(fd);
-    if (LOG_LEVEL != LOG_DISABLED) {
-        const char c;
-        bpf_get_current_comm((void*) &c, 6);
-        if ((bpf_strncmp(&c, 5, "curl") & bpf_strncmp(&c, 6, "nginx")) == 0) {
-            const static char m0[] = "[INFO ] [%-22s]: [update_trace_fd] trace was updated sucessfully. New FD: [%x].";
-            const static char m1[] = "[TRALL] [%-22s]: [update_trace_fd] no need to update trace - FD is identical [%x].";
-            const static char md[] = "[ERROR] [%-22s]: [update_trace_fd] invalid return value: %d.";
-
-            char* origin = rw == READ_OP ? "kprobe/sys_read" : "kprobe/sys_write";
-
-            switch (retval)
-            {
-            case 0:
-                if (LOG_LEVEL >= LOG_INFO) bpf_trace_printk(m0, sizeof(m0), origin, fd);
-                break;
-            case 1:
-                if (LOG_LEVEL >= LOG_TRACE_ALL) bpf_trace_printk(m1, sizeof(m1), origin, fd);
-                break;
-            case 2:
-                printk(LOG_TRACE_ALL, origin, "[update_trace_fd] trace is NULL.");
-                break;
-            case 3:
-                printk(LOG_TRACE, origin, "[update_trace_fd] trace is CLOSED.");
-                break;
-            case 4:
-                printk(LOG_TRACE, origin, "[update_trace_fd] trace is NOT connected.");
-                break;
-            default:
-                if (LOG_LEVEL >= LOG_ERROR) bpf_trace_printk(md, sizeof(md), origin, retval);
-                break;
-            }    
-        }
-    }
-
     return 0;
 }
 

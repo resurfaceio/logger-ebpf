@@ -1,9 +1,6 @@
 package main
 
-import (
-	"encoding/binary"
-	"log"
-)
+import "encoding/binary"
 
 const (
 	DATA byte = iota
@@ -53,22 +50,18 @@ func contains(streams *[][4]byte, id [4]byte) bool {
 	return false
 }
 
-func findStreamIndex(barray []byte, streams [][4]byte) int {
-	if len(barray) < 9 {
+func findKnownStream(barray []byte, streams *[][4]byte) int {
+	if len(barray) < 4 {
 		return -1
 	}
 	var id [4]byte
-	copy(id[:], barray[:4])
-	if contains(&streams, id) {
-		return 0
-	}
-	for i, b := range barray[4:] {
-		for _, stream := range streams {
+	for i, b := range barray[3:] {
+		for _, stream := range *streams {
 			if stream[3] == b {
-				copy(id[:], barray[i+1:i+5])
-				log.Printf("[H2] Checking prospect id: [%x]", id)
+				copy(id[:], barray[i:i+4])
+				// log.Printf("[H2] Checking prospect id: [% x] against stream ID: [% x]", id, stream)
 				if isSameStream(stream, id) {
-					return i + 1
+					return i
 				}
 			}
 		}
@@ -76,7 +69,37 @@ func findStreamIndex(barray []byte, streams [][4]byte) int {
 	return -1
 }
 
-func toh2frame(barray []byte, offset int, streams *[][4]byte) (frame h2frame, nextIndex int) {
+func findValidLen(barray []byte) int {
+	blen := uint32(len(barray))
+	if blen < 3 {
+		return -1
+	}
+
+	tmp := make([]byte, 4)
+	for i := range blen - 2 {
+		copy(tmp[1:], barray[i:i+3])
+		if binary.BigEndian.Uint32(tmp) < blen {
+			return int(i)
+		}
+	}
+
+	return -1
+}
+
+func lookupNextFrame(barrayp *[]byte, offset int, streams *[][4]byte) int {
+	if len(*barrayp) < offset+9 {
+		return -1
+	}
+	if i := findKnownStream((*barrayp)[offset+5:], streams); i != -1 {
+		return i + offset
+	} else if i := findValidLen(*barrayp); i != -1 {
+		return i + offset
+	}
+	return -1
+}
+
+func toh2frame(barrayp *[]byte, offset int, streams *[][4]byte) (frame h2frame, nextIndex int) {
+	barray := *barrayp
 	if offset+3 > len(barray) {
 		nextIndex = -1
 		frame._empty = true
@@ -104,7 +127,7 @@ func toh2frame(barray []byte, offset int, streams *[][4]byte) (frame h2frame, ne
 	copy(tmp[:], frame._streamID[:])
 	frame._streamIDd = binary.BigEndian.Uint32(tmp)
 
-	if frame._streamIDd != 0 && !contains(streams, frame._streamID) {
+	if !contains(streams, frame._streamID) {
 		*streams = append(*streams, frame._streamID)
 	}
 
@@ -120,38 +143,26 @@ func toh2frame(barray []byte, offset int, streams *[][4]byte) (frame h2frame, ne
 	return
 }
 
-func toFrames(frameBytes []byte, streams *[][4]byte) (frames []h2frame) {
-	var frame h2frame
-	var offset int = 0
-	var lastOffset int
-	var counter int = 0
+func toFrames(frameBytes []byte) (frames []h2frame) {
+	streams := make([][4]byte, 0, 5)
+	offset := 0
 	for offset < len(frameBytes) {
-		lastOffset = offset
-		frame, offset = toh2frame(frameBytes, lastOffset, streams)
-		if offset == -1 {
+		frame, n := toh2frame(&frameBytes, offset, &streams)
+		if n == -1 {
 			break
 		}
-		if offset == -2 {
-			log.Println("[H2] frame length is greater than array length. Assuming frame is corrupted. Trying to find known stream IDs from offset:", lastOffset)
-			if newOffset := findStreamIndex(frameBytes[lastOffset:], *streams); newOffset != -1 && newOffset+lastOffset >= 5 {
-				offset = newOffset + lastOffset - 5
-				log.Println("[H2] NEW OFFSET:", offset)
-				counter++
-			} else {
-				log.Printf("[H2] DID NOT FIND KNOWN STREAM [% x]", frameBytes)
+		if n == -2 {
+			// log.Printf("[H2] frame length is greater than the length of array %p. Assuming frame is corrupted. Trying to find known stream IDs from offset: %d", &frameBytes, offset+1)
+			if n = lookupNextFrame(&frameBytes, offset+1, &streams); n == -1 {
+				// log.Printf("[H2] COULD NOT FIND KNOWN STREAM [% x]", frameBytes)
 				break
 			}
+			// log.Println("[H2] NEW OFFSET:", n)
 		}
 		if !frame._empty {
 			frames = append(frames, frame)
 		}
-		if counter > 5 {
-			log.Printf("[H2] LOOPINGGG [% x]", frameBytes)
-			// will loop if offset == -2 more than once, i.e. if the length specified by the new offset found - 5B is greater than the array length
-			// which means we need to store lastFoundNewOffset and compare it to newOffset, and if they are equal, call findStreamIndex(framBytes[lastOffset+1:])
-			// is there a better way?
-			return
-		}
+		offset = n
 	}
 
 	return

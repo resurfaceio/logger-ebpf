@@ -35,7 +35,7 @@ const (
 )
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const LOG_LEVEL int = DEBUG
+const LOG_LEVEL int = TRACE
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -236,41 +236,44 @@ func main() {
 				delta := time.Duration(now - value.Ts)
 				pid := uint32(key)
 				id := uint64(pid) | (uint64(value.Fd) << 32)
-				log.Printf("[MAIN] Checking trace with ID=[%16x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)", id, pid, pid, value.Fd, value.Ts, now)
+				if LOG_LEVEL >= DEBUG {
+					log.Printf("[MAIN] Checking trace with ID=[%016x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)", id, pid, pid, value.Fd, value.Ts, now)
+					isTraceClosed(value)
+				}
 				if m, exists := messages[id]; exists {
-					if LOG_LEVEL >= DEBUG {
-						log.Printf("[MAIN] Message %d exists!", id)
+					if LOG_LEVEL >= TRACE {
+						log.Printf("[MAIN] Message [%016x] exists!", id)
 					}
 
 					if !m.isClosed && m.isToBeClosed {
 						m.isClosed = true
 						if LOG_LEVEL >= DEBUG {
-							log.Printf("[MAIN] Message [%16x] closed for ingestion.", id)
+							log.Printf("[MAIN] Message [%016x] closed for ingestion.", id)
 						}
 					}
 
 					if !m.isClosed && !m.isToBeClosed && isTraceClosed(value) {
 						m.isToBeClosed = true
 						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Message [%16x] to be closed for ingestion in the next check.", id)
+							log.Printf("[MAIN] Message [%016x] to be closed for ingestion in the next check.", id)
 						}
 					}
 
 					if m.isParsed || delta > 10*time.Second {
 						delete(messages, id)
 						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Message [%16x] removed from messages map.", id)
+							log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
 						}
 
 						objs.Traces.Delete(&key)
 						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Trace [% x] deleted from BPF map.", key)
+							log.Printf("[MAIN] Trace [%016x] deleted from BPF map.", key)
 						}
 					}
 				} else if delta > 5*time.Second {
 					objs.Traces.Delete(&key)
 					if LOG_LEVEL >= TRACE {
-						log.Printf("[MAIN] Trace [% x] timed out! Trace was deleted from BPF map.", id)
+						log.Printf("[MAIN] Trace [%016x] timed out! Trace was deleted from BPF map.", id)
 					}
 				}
 			}
@@ -326,16 +329,16 @@ func ingest(rec ringbuf.Record, isReq bool) {
 		if isReq {
 			t = "REQ"
 		}
-		log.Printf("[INGEST] %s - TRACE ID: %d [% x] (TGID: %d [% x], FD: %d [% x])\n", t, id, rawId, pid, rawPid, fd, rawFd)
+		if _, exists := messages[id]; !exists {
+			log.Println(SEP)
+		}
+		log.Printf("[INGEST] %s - NEW RECORD - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, rawId, pid, rawPid, rawFd)
 		if LOG_LEVEL >= TRACE {
 			log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, raw)
 		}
 	}
 
 	if message, exists := messages[id]; !exists {
-		if LOG_LEVEL >= DEBUG {
-			log.Println(SEP)
-		}
 		m := new(rawMessage)
 		m.createdAt = now
 		m.fd = fd
@@ -526,14 +529,13 @@ func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
 		parsedUrl := &url.URL{}
 		reqHeaders := http.Header{}
 		respHeaders := http.Header{}
-		streamIds := make([][4]byte, 0, 5)
 
 		for i, raw := range [][]byte{message.rawReq, message.rawResp} {
 			label := "REQ"
 			if i != 0 {
 				label = "RESP"
 			}
-			for _, frame := range toFrames(raw, &streamIds) {
+			for _, frame := range toFrames(raw) {
 				if LOG_LEVEL >= TRACE {
 					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
 					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
