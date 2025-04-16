@@ -7,15 +7,33 @@
 Run **Graylog API Security**
 
 ```sh
-docker run -v resurface:/db -d --name resurface -p 7700:7700 -p 7701:7701 --restart=always -e DB_HEAP=6g -e POLLING_CYCLE=fast -e TZ=America/Denver resurfaceio/resurface:3.7.84
+docker run -v resurface:/db -d --name resurface -p 7700:7700 -p 7701:7701 -e DB_HEAP=6g -e POLLING_CYCLE=fast -e TZ=America/Denver resurfaceio/resurface:3.7.84
 ```
 
-Build the binary (or get a pre-built one from our [releases](https://github.com/resurfaceio/logger-ebpf/releases))
+**Either** build the binary **or** get a pre-built one from our [releases](https://github.com/resurfaceio/logger-ebpf/releases)
+
+<table>
+<tr>
+<td> Build your own binary </td> <td> <a href="https://github.com/resurfaceio/logger-ebpf/releases/tag/v1.1.0">Download</a> pre-built binary </td>
+</tr>
+<tr>
+<td>
 
 ```sh
 cd ..
 make headers build
 ```
+
+</td>
+<td>
+    
+```sh
+cd ..
+mv ~/Downloads/ebpf-logger-amd64 ebpf-logger
+```
+</td>
+</tr>
+</table>
 
 Build the image
 
