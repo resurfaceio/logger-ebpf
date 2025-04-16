@@ -154,11 +154,5 @@ func load(exPath string, isClient bool) []closer {
 	}
 	closers = append(closers, entryShutdown)
 
-	exitShutdown, err := ex.Uretprobe("SSL_shutdown", objs.RetSslShutdown, nil)
-	if err != nil {
-		log.Panicln("Attaching uretprobe:", err)
-	}
-	closers = append(closers, exitShutdown)
-
 	return closers
 }

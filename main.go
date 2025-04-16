@@ -32,10 +32,11 @@ const (
 const (
 	TRACE_CLOSED     uint32 = 0x000000F0
 	TRACE_SSL_CLOSED uint32 = 0x0000F000
+	POISON           uint64 = 0x8D0003048D0304F0
 )
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const LOG_LEVEL int = TRACE
+const LOG_LEVEL int = ERROR
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -52,9 +53,10 @@ type rawMessage struct {
 	reqTime      time.Time
 	respTime     time.Time
 	isHttp2      bool
-	isClosed     bool
-	isToBeClosed bool
+	isReqClosed  bool
+	isRespClosed bool
 	isParsed     bool
+	id           uint64
 	fd           uint32
 }
 
@@ -62,7 +64,8 @@ var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 
 var messages map[uint64]*rawMessage
-var mc chan *parsedMessage
+var toParse chan *rawMessage
+var toProcess chan *parsedMessage
 var l *logger.HttpLogger
 
 func isTraceClosed(trace loggerTraceT) bool {
@@ -131,7 +134,8 @@ func main() {
 	r := make(chan ringbuf.Record)
 	w := make(chan ringbuf.Record)
 	messages = make(map[uint64]*rawMessage)
-	mc = make(chan *parsedMessage)
+	toParse = make(chan *rawMessage)
+	toProcess = make(chan *parsedMessage)
 
 	go readRing(readsReader, &r, "reads")
 	go readRing(writesReader, &w, "writes")
@@ -164,6 +168,7 @@ func main() {
 		log.Println("Waiting for any OpenSSL calls...")
 	}
 
+	go parse()
 	go process()
 
 	var (
@@ -208,27 +213,6 @@ func main() {
 		case record := <-w:
 			ingest(record, isClient)
 		default:
-			for id, message := range messages {
-				if message.isClosed && !message.isParsed && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
-					var isFinished bool
-					var parsed *parsedMessage
-					for !isFinished {
-						parsed, isFinished = parse(message)
-						if parsed != nil {
-							message.isParsed = true
-							if LOG_LEVEL >= DEBUG {
-								log.Printf("[MAIN] Message [%16x] successfully parsed.", id)
-								if LOG_LEVEL >= TRACE {
-									log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-									log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
-								}
-							}
-							mc <- parsed
-						}
-					}
-				}
-			}
-
 			entries := objs.Traces.Iterate()
 
 			for entries.Next(&key, &value) {
@@ -240,37 +224,7 @@ func main() {
 					log.Printf("[MAIN] Checking trace with ID=[%016x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)", id, pid, pid, value.Fd, value.Ts, now)
 					isTraceClosed(value)
 				}
-				if m, exists := messages[id]; exists {
-					if LOG_LEVEL >= TRACE {
-						log.Printf("[MAIN] Message [%016x] exists!", id)
-					}
-
-					if !m.isClosed && m.isToBeClosed {
-						m.isClosed = true
-						if LOG_LEVEL >= DEBUG {
-							log.Printf("[MAIN] Message [%016x] closed for ingestion.", id)
-						}
-					}
-
-					if !m.isClosed && !m.isToBeClosed && isTraceClosed(value) {
-						m.isToBeClosed = true
-						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Message [%016x] to be closed for ingestion in the next check.", id)
-						}
-					}
-
-					if m.isParsed || delta > 10*time.Second {
-						delete(messages, id)
-						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
-						}
-
-						objs.Traces.Delete(&key)
-						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Trace [%016x] deleted from BPF map.", key)
-						}
-					}
-				} else if delta > 5*time.Second {
+				if _, exists := messages[id]; !exists && delta > 5*time.Second {
 					objs.Traces.Delete(&key)
 					if LOG_LEVEL >= TRACE {
 						log.Printf("[MAIN] Trace [%016x] timed out! Trace was deleted from BPF map.", id)
@@ -310,6 +264,29 @@ func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
 	}
 }
 
+func parse() {
+	for message := range toParse {
+		if !message.isParsed && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
+			var isFinished bool
+			var parsed *parsedMessage
+			for !isFinished {
+				parsed, isFinished = parseFirstFound(message)
+				if parsed != nil {
+					message.isParsed = true
+					if LOG_LEVEL >= DEBUG {
+						log.Printf("[MAIN] Message [%16x] successfully parsed.", message.id)
+						if LOG_LEVEL >= TRACE {
+							log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
+							log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+						}
+					}
+					toProcess <- parsed
+				}
+			}
+		}
+	}
+}
+
 func ingest(rec ringbuf.Record, isReq bool) {
 	if len(rec.RawSample) < 8 {
 		return
@@ -324,12 +301,14 @@ func ingest(rec ringbuf.Record, isReq bool) {
 	rawId := make([]byte, 8)
 	binary.LittleEndian.PutUint64(rawId, id)
 
+	message, isPresent := messages[id]
+
 	if LOG_LEVEL >= DEBUG {
 		t := "RESP"
 		if isReq {
 			t = "REQ"
 		}
-		if _, exists := messages[id]; !exists {
+		if !isPresent {
 			log.Println(SEP)
 		}
 		log.Printf("[INGEST] %s - NEW RECORD - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, rawId, pid, rawPid, rawFd)
@@ -338,36 +317,48 @@ func ingest(rec ringbuf.Record, isReq bool) {
 		}
 	}
 
-	if message, exists := messages[id]; !exists {
-		m := new(rawMessage)
-		m.createdAt = now
-		m.fd = fd
+	if !isPresent {
+		message = new(rawMessage)
+		message.createdAt = now
+		message.fd = fd
+		message.id = id
 
 		if isReq {
-			m.reqTime = now
-			m.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
-			if m.isHttp2 {
+			message.reqTime = now
+			message.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
+			if message.isHttp2 {
 				raw = raw[24:]
 			}
 		} else {
-			m.respTime = now
+			message.respTime = now
 		}
-		messages[id] = m
+		messages[id] = message
 	} else {
 		if len(message.rawReq) == 0 && isReq {
-			messages[id].reqTime = now
-			messages[id].isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
-			if messages[id].isHttp2 {
+			message.reqTime = now
+			message.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
+			if message.isHttp2 {
 				raw = raw[24:]
 			}
 		} else if len(message.rawResp) == 0 && !isReq {
-			messages[id].respTime = now
+			message.respTime = now
 		}
 	}
 
-	message := messages[id]
-
-	if isReq {
+	if len(raw) == 8 && binary.LittleEndian.Uint64(raw) == POISON {
+		if isReq {
+			message.isReqClosed = true
+		} else {
+			message.isRespClosed = true
+		}
+		if message.isReqClosed && message.isRespClosed {
+			toParse <- message
+			delete(messages, id)
+			if LOG_LEVEL >= TRACE {
+				log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
+			}
+		}
+	} else if isReq {
 		message.rawReq = append(message.rawReq, raw...)
 	} else {
 		message.rawResp = append(message.rawResp, raw...)
@@ -391,7 +382,7 @@ func parseHeaders(toParse []byte, existingHeaders http.Header) (headers http.Hea
 	return
 }
 
-func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
+func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool) {
 	consumed = true
 	parsed = new(parsedMessage)
 	parsed.isHttp2 = message.isHttp2
@@ -651,7 +642,7 @@ func parse(message *rawMessage) (parsed *parsedMessage, consumed bool) {
 
 func process() {
 	for {
-		message := <-mc
+		message := <-toProcess
 		if message != nil {
 			if LOG_LEVEL >= DEBUG {
 				log.Println(SEP)

@@ -34,8 +34,9 @@
 #define MAX_U32_VALUE       0xFFFFFFFF  // max u32 = (255) + (255 << 8) + (255 << 16) + (255 << 24) = 4294967295
 
 #define MAX_BYTES           1024
+#define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
-#define LOG_LEVEL           LOG_TRACE
+#define LOG_LEVEL           LOG_ERROR
 
 /**
  * 
@@ -528,6 +529,29 @@ static int exit_accept(int fd, int is_accept4) {
     return 0;
 }
 
+static int poison_well() {
+    const static u64 pill = POISON;
+
+    u64 id = bpf_get_current_pid_tgid();
+
+    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
+    if (trace == NULL) {
+        printk(LOG_TRACE, "poison_well", "trace is NULL");
+        return 1;
+    }
+    u64 fd = (u64) trace->fd;
+    
+    u128 packaged = pill;
+    packaged = (packaged << 64) | (fd << 32) | (id >> 32);
+    
+    printk(LOG_DEBUG, "poison_well", "pill ready for ringbuf");
+
+    int r = (int) bpf_ringbuf_output(&reads, &packaged, sizeof(u128), 0);
+    int w = (int) bpf_ringbuf_output(&writes, &packaged, sizeof(u128), 0);
+
+    return r || w;
+}
+
 /**
  * 
  * Kernel probes
@@ -678,29 +702,11 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
         bpf_trace_printk(m, sizeof(m), id);
     }
 
-    update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_AJAR);
-
-    return 0;
-}
-
-SEC("uretprobe/SSL_shutdown")
-int BPF_URETPROBE(ret_ssl_shutdown) {
-    int rc = PT_REGS_RC(ctx);
-    if (rc == 1) {
-        if (LOG_LEVEL >= LOG_DEBUG) {
-            const u64 id = bpf_get_current_pid_tgid();
-            const static char m[] = "[DEBUG] [uretprobe/SSL_shutdown]: TLS/SSL shutdown completed successfully for PID %d.";
-            bpf_trace_printk(m, sizeof(m), id);
-        }
-
-        update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
-
-    } else {
-        if (LOG_LEVEL >= LOG_TRACE) {
-            const u64 id = bpf_get_current_pid_tgid();
-            const static char m[] = "[TRACE] [uretprobe/SSL_shutdown]: failed to shutdown TLS/SSL connection for PID %d. Return code: %d";
-            bpf_trace_printk(m, sizeof(m), id, rc);
-        }
+    if (poison_well() == 0) {
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", " poison pill sent.");
+    }
+    if (delete_trace() == 0) {
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", "trace deleted successfully.");
     }
 
     return 0;
@@ -735,10 +741,6 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
         }
     }
 
-    if (n <= 0 && is_set(TRACE_SSL_AJAR, NULL)) {
-        update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
-        printk(LOG_DEBUG, "uretprobe/SSL_read", "trace is now SSL closed");
-    }
     return (SSL_exit(ctx, READ_OP));
 }
 
@@ -753,10 +755,6 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
         }
     }
 
-    if (n <= 0 && is_set(TRACE_SSL_AJAR, NULL)) {
-        update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CLOSED);
-        printk(LOG_DEBUG, "uretprobe/SSL_write", "trace is now SSL closed");
-    }
     return (SSL_exit(ctx, WRITE_OP));
 }
 
