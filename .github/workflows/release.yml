@@ -18,16 +18,16 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         args: 'ebpf-logger-amd64'
-  build-arm64:
-    runs-on: ubuntu-24.04-arm
-    steps:
-    - name: checkout
-      uses: actions/checkout@master
-    - name: build
-      uses: ./.github/build-action/
-    - name: release
-      uses: skx/github-action-publish-binaries@release-2.0
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        args: 'ebpf-logger-arm64'
+  # build-arm64:
+  #   runs-on: ubuntu-24.04-arm
+  #   steps:
+  #   - name: checkout
+  #     uses: actions/checkout@master
+  #   - name: build
+  #     uses: ./.github/build-action/
+  #   - name: release
+  #     uses: skx/github-action-publish-binaries@release-2.0
+  #     env:
+  #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #     with:
+  #       args: 'ebpf-logger-arm64'
