@@ -36,7 +36,7 @@
 #define MAX_BYTES           1024
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
-#define LOG_LEVEL           LOG_ERROR
+#define LOG_LEVEL           LOG_DEBUG
 
 /**
  * 

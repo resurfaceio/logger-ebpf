@@ -29,14 +29,9 @@ const (
 	TRACE
 )
 
-const (
-	TRACE_CLOSED     uint32 = 0x000000F0
-	TRACE_SSL_CLOSED uint32 = 0x0000F000
-	POISON           uint64 = 0x8D0003048D0304F0
-)
+const POISON uint64 = 0x8D0003048D0304F0
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const LOG_LEVEL int = ERROR
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -60,22 +55,20 @@ type rawMessage struct {
 	fd           uint32
 }
 
+type rawRecord struct {
+	raw   *[]byte
+	isReq bool
+}
+
+var LOG_LEVEL int = TRACE
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 
 var messages map[uint64]*rawMessage
+var toIngest chan *rawRecord
 var toParse chan *rawMessage
 var toProcess chan *parsedMessage
 var l *logger.HttpLogger
-
-func isTraceClosed(trace loggerTraceT) bool {
-	if LOG_LEVEL >= DEBUG {
-		log.Printf(" [MAIN] Trace flags: [%08x]", trace.Flags)
-	}
-	closed := (trace.Flags & TRACE_CLOSED) == TRACE_CLOSED
-	ssl_closed := (trace.Flags & TRACE_SSL_CLOSED) == TRACE_SSL_CLOSED
-	return closed || ssl_closed
-}
 
 func getNanoKtime() uint64 {
 	var ts unix.Timespec
@@ -89,6 +82,14 @@ func getNanoKtime() uint64 {
 
 func main() {
 	defer log.Println("All done. Bye!")
+
+	if level, err := strconv.Atoi(os.Getenv("USAGE_LOGGERS_EBPF_LOG_LEVEL")); err == nil {
+		if level < NOLOG {
+			LOG_LEVEL = NOLOG
+		} else {
+			LOG_LEVEL = min(level, TRACE)
+		}
+	}
 
 	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
 
@@ -131,14 +132,13 @@ func main() {
 	}
 	defer writesReader.Close()
 
-	r := make(chan ringbuf.Record)
-	w := make(chan ringbuf.Record)
 	messages = make(map[uint64]*rawMessage)
+	toIngest = make(chan *rawRecord)
 	toParse = make(chan *rawMessage)
 	toProcess = make(chan *parsedMessage)
 
-	go readRing(readsReader, &r, "reads")
-	go readRing(writesReader, &w, "writes")
+	go readRing(readsReader, true, isClient)
+	go readRing(writesReader, false, isClient)
 
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt)
@@ -168,8 +168,9 @@ func main() {
 		log.Println("Waiting for any OpenSSL calls...")
 	}
 
-	go parse()
 	go process()
+	go parse()
+	go ingest()
 
 	var (
 		key   uint64
@@ -208,10 +209,6 @@ func main() {
 			}
 			return
 
-		case record := <-r:
-			ingest(record, !isClient)
-		case record := <-w:
-			ingest(record, isClient)
 		default:
 			entries := objs.Traces.Iterate()
 
@@ -220,9 +217,9 @@ func main() {
 				delta := time.Duration(now - value.Ts)
 				pid := uint32(key)
 				id := uint64(pid) | (uint64(value.Fd) << 32)
-				if LOG_LEVEL >= DEBUG {
-					log.Printf("[MAIN] Checking trace with ID=[%016x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)", id, pid, pid, value.Fd, value.Ts, now)
-					isTraceClosed(value)
+				if LOG_LEVEL >= TRACE {
+					log.Printf("[MAIN] Checking trace with ID=[%016x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)\n", id, pid, pid, value.Fd, value.Ts, now)
+					log.Printf("[MAIN] Trace flags: [%08x]", value.Flags)
 				}
 				if _, exists := messages[id]; !exists && delta > 5*time.Second {
 					objs.Traces.Delete(&key)
@@ -244,14 +241,25 @@ func main() {
 	}
 }
 
-func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
+func readRing(reader *ringbuf.Reader, fromReads bool, isClient bool) {
+	name := "reads"
+	if !fromReads {
+		name = "writes"
+	}
 	for {
 		if received, err := reader.Read(); err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				if LOG_LEVEL >= INFO {
-					log.Printf("closing %s channel...\n", name)
+					log.Println("closing ingestion channel...")
 				}
-				close(*c)
+				select {
+				case _, ok := <-toIngest:
+					if ok {
+						close(toIngest)
+					}
+				default:
+					close(toIngest)
+				}
 				return
 			}
 			if LOG_LEVEL >= INFO {
@@ -259,7 +267,10 @@ func readRing(reader *ringbuf.Reader, c *chan ringbuf.Record, name string) {
 			}
 			continue
 		} else {
-			*c <- received
+			toIngest <- &rawRecord{
+				raw:   &received.RawSample,
+				isReq: fromReads != isClient,
+			}
 		}
 	}
 }
@@ -287,81 +298,85 @@ func parse() {
 	}
 }
 
-func ingest(rec ringbuf.Record, isReq bool) {
-	if len(rec.RawSample) < 8 {
-		return
-	}
-	now := time.Now()
-	rawPid := rec.RawSample[:4]
-	rawFd := rec.RawSample[4:8]
-	pid := binary.LittleEndian.Uint32(rawPid)
-	fd := binary.LittleEndian.Uint32(rawFd)
-	raw := rec.RawSample[8:]
-	id := uint64(pid) | (uint64(fd) << 32)
-	rawId := make([]byte, 8)
-	binary.LittleEndian.PutUint64(rawId, id)
-
-	message, isPresent := messages[id]
-
-	if LOG_LEVEL >= DEBUG {
-		t := "RESP"
-		if isReq {
-			t = "REQ"
+func ingest() {
+	for record := range toIngest {
+		raw := *record.raw
+		isReq := record.isReq
+		if len(raw) < 8 {
+			return
 		}
-		if !isPresent {
-			log.Println(SEP)
-		}
-		log.Printf("[INGEST] %s - NEW RECORD - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, rawId, pid, rawPid, rawFd)
-		if LOG_LEVEL >= TRACE {
-			log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, raw)
-		}
-	}
+		now := time.Now()
+		rawPid := raw[:4]
+		rawFd := raw[4:8]
+		pid := binary.LittleEndian.Uint32(rawPid)
+		fd := binary.LittleEndian.Uint32(rawFd)
+		payload := raw[8:]
+		id := uint64(pid) | (uint64(fd) << 32)
+		rawId := make([]byte, 8)
+		binary.LittleEndian.PutUint64(rawId, id)
 
-	if !isPresent {
-		message = new(rawMessage)
-		message.createdAt = now
-		message.fd = fd
-		message.id = id
+		message, isPresent := messages[id]
 
-		if isReq {
-			message.reqTime = now
-			message.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
-			if message.isHttp2 {
-				raw = raw[24:]
+		if LOG_LEVEL >= DEBUG {
+			t := "RESP"
+			if isReq {
+				t = "REQ"
 			}
-		} else {
-			message.respTime = now
-		}
-		messages[id] = message
-	} else {
-		if len(message.rawReq) == 0 && isReq {
-			message.reqTime = now
-			message.isHttp2 = len(raw) >= 24 && string(raw[:24]) == http2.ClientPreface
-			if message.isHttp2 {
-				raw = raw[24:]
+			if !isPresent {
+				log.Println(SEP)
 			}
-		} else if len(message.rawResp) == 0 && !isReq {
-			message.respTime = now
-		}
-	}
-
-	if len(raw) == 8 && binary.LittleEndian.Uint64(raw) == POISON {
-		if isReq {
-			message.isReqClosed = true
-		} else {
-			message.isRespClosed = true
-		}
-		if message.isReqClosed && message.isRespClosed {
-			toParse <- message
-			delete(messages, id)
+			log.Printf("[INGEST] %s - NEW RECORD - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, rawId, pid, rawPid, rawFd)
 			if LOG_LEVEL >= TRACE {
-				log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
+				log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, payload)
 			}
 		}
-	} else if isReq {
-		message.rawReq = append(message.rawReq, raw...)
-	} else {
-		message.rawResp = append(message.rawResp, raw...)
+
+		if !isPresent {
+			message = new(rawMessage)
+			message.createdAt = now
+			message.fd = fd
+			message.id = id
+
+			if isReq {
+				message.reqTime = now
+				message.isHttp2 = len(payload) >= 24 && string(payload[:24]) == http2.ClientPreface
+				if message.isHttp2 {
+					payload = payload[24:]
+				}
+			} else {
+				message.respTime = now
+			}
+			messages[id] = message
+		} else {
+			if len(message.rawReq) == 0 && isReq {
+				message.reqTime = now
+				message.isHttp2 = len(payload) >= 24 && string(payload[:24]) == http2.ClientPreface
+				if message.isHttp2 {
+					payload = payload[24:]
+				}
+			} else if len(message.rawResp) == 0 && !isReq {
+				message.respTime = now
+			}
+		}
+
+		if len(payload) == 8 && binary.LittleEndian.Uint64(payload) == POISON {
+			if isReq {
+				message.isReqClosed = true
+			} else {
+				message.isRespClosed = true
+			}
+			if message.isReqClosed && message.isRespClosed {
+				toParse <- message
+				delete(messages, id)
+				if LOG_LEVEL >= TRACE {
+					log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
+				}
+			}
+		} else if isReq {
+			message.rawReq = append(message.rawReq, payload...)
+		} else {
+			message.rawResp = append(message.rawResp, payload...)
+		}
 	}
 
 }
