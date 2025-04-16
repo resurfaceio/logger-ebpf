@@ -52,7 +52,7 @@ docker run -d --rm --name nginx-demo --privileged -p 8443:443 ebpf-logger-nginx:
 Make some calls to it
 
 ```sh
-curl -k -H "Host: mydemo" https://mydemo:8443/json
+curl -k -H "Host: mydemo" https://localhost:8443/json
 ```
 
 Go to http://localhost:7700/ and see your calls flowing in!
