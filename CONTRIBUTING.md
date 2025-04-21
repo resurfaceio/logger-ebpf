@@ -67,7 +67,3 @@ The values can be modified by updating the `.env` file generated with `make dote
 ```bash
 make build run
 ```
-
-## Running Locally in container
-
-See our [nginx-demo](https://github.com/resurfaceio/logger-ebpf/tree/master/nginx-demo)!

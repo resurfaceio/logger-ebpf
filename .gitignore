@@ -2,7 +2,6 @@
 *.o
 *.save
 *.conf
-!nginx.conf
 
 # ignore ebpf-specific generated files
 logger_bpfeb.go
