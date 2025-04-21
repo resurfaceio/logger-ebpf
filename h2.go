@@ -1,3 +1,5 @@
+// © 2025 Graylog, Inc.
+
 package main
 
 import "encoding/binary"

@@ -1,6 +1,6 @@
 //go:build ignore
 
-// © 2016-2024 Graylog, Inc.
+// © 2025 Graylog, Inc.
 
 #include "vmlinux.h"
 #include <bpf/bpf_tracing.h>

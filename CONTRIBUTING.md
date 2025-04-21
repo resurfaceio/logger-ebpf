@@ -1,4 +1,5 @@
-# Contributing to logger-ebpf
+# Contributing
+&copy; 2025 Graylog, Inc.
 
 ## Configuring Development Environment
 

@@ -1,3 +1,5 @@
+// © 2025 Graylog, Inc.
+
 module ebpf-logger
 
 go 1.23.0

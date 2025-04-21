@@ -1,4 +1,4 @@
-# resurfaceio-logger-ebpf
+# logger-ebpf
 Easily log **encrypted** API requests and responses to your own <a href="https://resurface.io">security data lake</a>.
 
 [![CodeFactor](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf/badge?s=1edfaf41d674519709d3abb9c1836e84b4c3a20f)](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf)
@@ -124,4 +124,4 @@ but logging rules are easily customized to meet the needs of any application.
 <a href="https://go2docs.graylog.org/apisecurity-current/logging_rules/logging_rules.htm">Logging rules documentation</a>
 
 ---
-<small>&copy; 2016-2025 <a href="https://resurface.io">Graylog, Inc.</a></small>
+<small>&copy; 2025 <a href="https://resurface.io">Graylog, Inc.</a></small>
