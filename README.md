@@ -86,7 +86,7 @@ coming soon!
 ## Protecting User Privacy
 
 Loggers always have an active set of [logging rules](https://go2docs.graylog.org/apisecurity-current/logging_rules/logging_rules.htm)
-that control what data is logged and how sensitive data is masked. All of the examples above apply a predefined set of rules (`include_debug`),
+that control what data is logged and how sensitive data is masked. All of the examples above apply a predefined set of rules (`include debug`),
 but logging rules are easily customized to meet your privacy requirements.
 
 ---
