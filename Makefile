@@ -29,5 +29,5 @@ headers:
 dotenv:
 	cp --update=none .env.example .env
 clean:
-	sed -i '3s/go:/x86_64:/;5s/go:/aarch64:/' gen.go
+	sed -i '5s/go:/x86_64:/;7s/go:/aarch64:/' gen.go
 	rm -f ebpf-logger* logger_*.go logger_*.o

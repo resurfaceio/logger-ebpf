@@ -33,7 +33,7 @@
 #define ZERO                0
 #define MAX_U32_VALUE       0xFFFFFFFF  // max u32 = (255) + (255 << 8) + (255 << 16) + (255 << 24) = 4294967295
 
-#define MAX_BYTES           1024
+#define MAX_BYTES           1048576
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
 #define LOG_LEVEL           LOG_DEBUG
@@ -95,12 +95,12 @@ struct data_t rdata, wdata;
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 4194304);
 } reads SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 4194304);
 } writes SEC(".maps");
 
 struct {
@@ -758,4 +758,4 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
     return (SSL_exit(ctx, WRITE_OP));
 }
 
-char __license[] SEC("license") = "Dual MIT/GPL";
+char __license[] SEC("license") = "GPL v2";
