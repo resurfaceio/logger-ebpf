@@ -45,15 +45,13 @@ for analysis and storage. This agent logs encrypted API calls without configurin
 
 ## Environment Variables
 
-These environment variables are used to configure this eBPF agent and to control what information is logged.
+These environment variables are required to configure this eBPF agent and to control what information is logged.
 
-| Variable Name             | Default | Description                                                                                                                                                                                        |
-|---------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| USAGE_LOGGERS_DISABLE     | false   | When `true`, the eBPF agent is loaded but no calls are logged                                                                                                                                      |
-| USAGE_LOGGERS_EBPF_EXPATH | (none)  | Path to OpenSSL shared library<br>Use `ldconfig -p \| grep ssl` to find                                                                                                                            |
-| USAGE_LOGGERS_EBPF_ROLE   | (none)  | Use `server` for inbound calls, `client` for outbound calls                                                                                                                                        |
-| USAGE_LOGGERS_RULES       | (none)  | [Logging rules](https://go2docs.graylog.org/apisecurity-current/logging_rules/logging_rules.htm) used to mask or remove specific details<br>Use `import debug` to log entire request and response  |
-| USAGE_LOGGERS_URL         | (none)  | [Capture URL](https://go2docs.graylog.org/apisecurity-current/capture_api_calls/capture_api_calls.htm) for Graylog API Security instance<br>Looks like `https://GL_APISECURITY_HOST/fluke/message` |
+| Variable Name             | Description                                                                                                                                                                                        |
+|---------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| USAGE_LOGGERS_EBPF_EXPATH | Path to OpenSSL shared library<br>Use `ldconfig -p \| grep ssl` to find                                                                                                                            |
+| USAGE_LOGGERS_RULES       | [Logging rules](https://go2docs.graylog.org/apisecurity-current/logging_rules/logging_rules.htm) used to mask or remove specific details<br>Use `include debug` to log entire request and response |
+| USAGE_LOGGERS_URL         | [Capture URL](https://go2docs.graylog.org/apisecurity-current/capture_api_calls/capture_api_calls.htm) for Graylog API Security instance<br>Looks like `https://GL_APISECURITY_HOST/fluke/message` |
 
 <a name="logging-from-linux-vm-or-physical-machine"></a>
 
@@ -66,7 +64,7 @@ wget https://github.com/resurfaceio/logger-ebpf/releases/download/v1.1.0/ebpf-lo
 
 Run agent binary, with your value for `GL_APISECURITY_HOST`:
 ```bash
-sudo USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3" USAGE_LOGGERS_EBPF_ROLE="server" USAGE_LOGGERS_RULES="include debug" USAGE_LOGGERS_URL="https://GL_APISECURITY_HOST/fluke/message" ./ebpf-logger-amd64
+sudo USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3" USAGE_LOGGERS_RULES="include debug" USAGE_LOGGERS_URL="https://GL_APISECURITY_HOST/fluke/message" ./ebpf-logger-amd64
 ```
 
 ⚠️ Use `CRTL-C` to stop the agent.
