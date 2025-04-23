@@ -36,6 +36,7 @@ for analysis and storage. This agent logs encrypted API calls without configurin
 
 ## Current Limitations
 
+* ⚠️ This is beta software and not ready for production environments
 * ARM64 chipsets are not yet supported
 * API calls made via HTTP are not logged yet (only HTTPS)
 * Only applications using OpenSSL are supported (additional encryption libraries coming soon)
