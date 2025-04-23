@@ -67,7 +67,7 @@ Run agent binary, with your value for `GL_APISECURITY_HOST`:
 sudo USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3" USAGE_LOGGERS_RULES="include debug" USAGE_LOGGERS_URL="https://GL_APISECURITY_HOST/fluke/message" ./ebpf-logger-amd64
 ```
 
-⚠️ Use `CRTL-C` to stop the agent.
+⚠️ Use `CTRL-C` to stop the agent.
 
 <a name="logging-from-docker-container"></a>
 
