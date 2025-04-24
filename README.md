@@ -2,13 +2,13 @@
 Easily log **encrypted** API calls to your own <a href="https://graylog.org/products/api-security/">security data lake</a>.
 
 This open-source [eBPF](https://ebpf.io/) agent logs API requests and responses to [Graylog API Security](https://graylog.org/products/api-security/)
-for analysis and storage. This agent logs encrypted API calls without configuring any encryption keys or making any changes to client or server applications. 
+for analysis and storage. This logger captures encrypted API calls without configuring any encryption keys or making any changes to client or server applications. 
 
 [![CodeFactor](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf/badge?s=1edfaf41d674519709d3abb9c1836e84b4c3a20f)](https://www.codefactor.io/repository/github/resurfaceio/logger-ebpf)
 [![Contributing](https://img.shields.io/badge/contributions-welcome-green.svg)](https://github.com/resurfaceio/logger-ebpf/blob/master/CONTRIBUTING.md)
 [![License](https://img.shields.io/github/license/resurfaceio/logger-ebpf?s=1edfaf41d674519709d3abb9c1836e84b4c3a20f)](https://github.com/resurfaceio/logger-ebpf/blob/master/LICENSE)
 
-⚠️ [Graylog API Security](https://graylog.org/products/api-security/) is licensed and installed separately, and runs as a remote service (on Kubernetes) that receives data from this eBPF agent.
+⚠️ [Graylog API Security](https://graylog.org/products/api-security/) is licensed and installed separately, and runs as a remote service (on Kubernetes) that receives data from this logger.
 
 ## Contents
 
@@ -29,7 +29,7 @@ for analysis and storage. This agent logs encrypted API calls without configurin
 * 64-bit Intel or AMD CPU
 * Linux kernel v5.8 or higher
 * OpenSSL v1.0 or higher
-* Root privileges to run the eBPF agent binary
+* Root user or sudo privileges
 * Network access to the Kubernetes cluster where [Graylog API Security](https://graylog.org/products/api-security/) is running
 
 <a name="current-limitations"></a>
@@ -46,7 +46,7 @@ for analysis and storage. This agent logs encrypted API calls without configurin
 
 ## Environment Variables
 
-These environment variables are required to configure this eBPF agent and to control what information is logged.
+These environment variables are required to configure the logger and to control what information is logged.
 
 | Variable Name             | Description                                                                                                                                                                                        |
 |---------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -58,17 +58,17 @@ These environment variables are required to configure this eBPF agent and to con
 
 ## Logging from Linux VM or Physical Machine
 
-Download agent binary:
+Download logger binary:
 ```bash
-wget https://github.com/resurfaceio/logger-ebpf/releases/download/v1.1.0/ebpf-logger-amd64 && chmod +x ebpf-logger-amd64
+wget https://github.com/resurfaceio/logger-ebpf/releases/download/v1.1.1/ebpf-logger-amd64 && chmod +x ebpf-logger-amd64
 ```
 
-Run agent binary, with your value for `GL_APISECURITY_HOST`:
+Run logger binary, with your value for `GL_APISECURITY_HOST`:
 ```bash
 sudo USAGE_LOGGERS_EBPF_EXPATH="/lib/x86_64-linux-gnu/libssl.so.3" USAGE_LOGGERS_RULES="include debug" USAGE_LOGGERS_URL="https://GL_APISECURITY_HOST/fluke/message" ./ebpf-logger-amd64
 ```
 
-⚠️ Use `CTRL-C` to stop the agent.
+⚠️ Use `CTRL-C` to stop the logger.
 
 <a name="logging-from-docker-container"></a>
 
