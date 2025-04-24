@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -517,6 +518,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 			Header:        reqHeaders,
 			Body:          io.NopCloser(bytes.NewReader(req[2])),
 			ContentLength: int64(len(req[2])),
+			TLS:           &tls.ConnectionState{},
 		}
 
 		if parsedUrl.IsAbs() {
@@ -635,6 +637,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 				Header:        reqHeaders,
 				Body:          io.NopCloser(bytes.NewReader(reqBody)),
 				ContentLength: int64(len(reqBody)),
+				TLS:           &tls.ConnectionState{},
 			}
 
 			if parsedUrl.IsAbs() {
