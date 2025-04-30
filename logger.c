@@ -33,7 +33,9 @@
 #define ZERO                0
 #define MAX_U32_VALUE       0xFFFFFFFF  // max u32 = (255) + (255 << 8) + (255 << 16) + (255 << 24) = 4294967295
 
-#define MAX_BYTES           1048576
+#define MAX_BYTES           512
+#define MAX_ITERATIONS      50
+#define RINGBUF_SIZE        4194304
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
 #define LOG_LEVEL           LOG_DEBUG
@@ -95,12 +97,12 @@ struct data_t rdata, wdata;
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4194304);
+    __uint(max_entries, RINGBUF_SIZE);
 } reads SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4194304);
+    __uint(max_entries, RINGBUF_SIZE);
 } writes SEC(".maps");
 
 struct {
@@ -154,6 +156,32 @@ static void printk(int level, char* origin, char* message) {
     }
 }
 
+/**
+ * @name min
+ * @brief Compares two integers and returns the smallest.
+ * @param a integer to compare.
+ * @param b another integer to compare.
+ * @return smallest of the two arguments.
+ */
+static int min(int a, int b) {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+
+
+
+static long enforce_bounds(long i, long lower, long upper) {
+    if (i < lower) i = lower;
+    if (i > upper) i = upper;
+    return i;
+}
+
+static int enforce_bounds_int(int i, int lower, int upper) {
+    return (int) enforce_bounds((long) i, (long) lower, (long) upper);
+}
 
 /**
  * 
@@ -434,10 +462,14 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
         printk(LOG_DEBUG, "SSL_exit", "byte_count <= 0");
         return 3;
     }
+    
+    int n = 1;
+    int data_size = byte_count;
     if (byte_count > MAX_BYTES) {
-        byte_count = MAX_BYTES;
+        n = byte_count / MAX_BYTES;
+        if (byte_count % MAX_BYTES) n++;
+        data_size = MAX_BYTES;
     }
-    u64 packaged_size = sizeof(struct data_t) - MAX_BYTES + byte_count;
 
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace == NULL) {
@@ -451,29 +483,57 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
     }
 
     fd = trace->fd;
-
     printk(LOG_DEBUG, "SSL_exit", "message ready for ringbuf");
 
+    int rc = 0;
+    u64 packaged_size = sizeof(struct data_t);
     if (rw == READ_OP) {
         rdata.id = tgid;
         rdata.fd = fd;
-        buf = (char *) trace->readsbp;
-        if (bpf_probe_read_user(&rdata.data, byte_count, buf) < 0) {
-            return 4;
-        }
-        return (int) bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
     } else if (rw == WRITE_OP) {
         wdata.id = tgid;
         wdata.fd = fd;
-        buf = (char *) trace->writesbp;
-        if (bpf_probe_read_user(&wdata.data, byte_count, buf) < 0) {
-            return 4;
-        }
-        return (int) bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
         return 5;
     }
+
+    for (int i = 0; i < min(n, MAX_ITERATIONS); i++) {
+        if (rw == READ_OP) {
+            buf = (char *) ((trace->readsbp) + (i * MAX_BYTES));
+            if (i == n - 1) {
+                data_size = byte_count - (i * MAX_BYTES);
+            }
+            data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
+
+            if (bpf_probe_read_user(&rdata.data, data_size, buf) < 0) {
+                return 4;
+            }
+            packaged_size = packaged_size - MAX_BYTES + data_size;
+            packaged_size = enforce_bounds(packaged_size, 0, sizeof(struct data_t));
+            rc |= (int) bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
+            if (rc != 0) {
+                return rc;
+            }
+        } else {
+            buf = (char *) ((trace->writesbp) + (i * MAX_BYTES));
+            if (i == n - 1) {
+                data_size = byte_count - (i * MAX_BYTES);
+            }
+            data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
+            if (bpf_probe_read_user(&wdata.data, data_size, buf) < 0) {
+                return 4;
+            }
+            packaged_size = packaged_size - MAX_BYTES + data_size;
+            packaged_size = enforce_bounds(packaged_size, 0, sizeof(struct data_t));
+            rc |= (int) bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
+            if (rc != 0) {
+                return rc;
+            }
+        }
+    }
+
+    return rc;
 }
 
 static int entry_accept(int fd, int is_accept4) {
