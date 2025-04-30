@@ -63,9 +63,15 @@ type rawRecord struct {
 	isReq bool
 }
 
+type httpChecker struct {
+	client *http.Client
+	req    *http.Request
+}
+
 var LOG_LEVEL int = TRACE
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
+var flukeChecker *httpChecker
 
 var messages map[uint64]*rawMessage
 var toIngest chan *rawRecord
@@ -81,6 +87,18 @@ func getNanoKtime() uint64 {
 	}
 
 	return uint64(unix.TimespecToNsec(ts))
+}
+
+func isFlukeReachable() bool {
+	resp, err := flukeChecker.client.Do(flukeChecker.req)
+	if err != nil {
+		if LOG_LEVEL >= ERROR {
+			log.Println("error: ", err)
+		}
+	} else if resp != nil && resp.StatusCode == 204 {
+		return true
+	}
+	return false
 }
 
 func main() {
@@ -162,10 +180,31 @@ func main() {
 		}
 		return
 	}
+
+	flukeUrl := os.Getenv("USAGE_LOGGERS_URL")
+	flukeChecker = &httpChecker{
+		client: &http.Client{},
+	}
+	flukeChecker.req, err = http.NewRequest("POST", flukeUrl, bytes.NewBuffer([]byte("")))
+	if err != nil {
+		if LOG_LEVEL >= ERROR {
+			log.Println("error creating fluke checker: ", err)
+		}
+		return
+	} else {
+		flukeChecker.req.Header.Set("Content-Type", "application/ndjson; charset=UTF-8")
+		logger.GetUsageLoggers()
+		flukeChecker.req.Header.Set("User-Agent", "Resurface/0.1 (test)")
+	}
+
+	if !isFlukeReachable() && LOG_LEVEL >= WARN {
+		log.Println("warning: not able to reach fluke during logger initialization")
+	}
+
 	if LOG_LEVEL >= INFO {
 		log.Println("logger is initialized")
 		if LOG_LEVEL >= DEBUG {
-			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
+			log.Println("  url:   ", flukeUrl)
 			log.Println("  rules: ", opts.Rules)
 		}
 		log.Println("Waiting for any OpenSSL calls...")
@@ -686,7 +725,14 @@ func process() {
 					message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			}
-			logger.SendHttpMessage(l, &message.httpResp, &message.httpReq, message.responseMillis, message.interval, nil)
+			if isFlukeReachable() {
+				logger.SendHttpMessage(l, &message.httpResp, &message.httpReq, message.responseMillis, message.interval, nil)
+			} else {
+				if LOG_LEVEL >= ERROR {
+					log.Println("[PROCESS] Could not send message. Fluke server is not reachable at the moment")
+				}
+				continue
+			}
 		}
 	}
 }
