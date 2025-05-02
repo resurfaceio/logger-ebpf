@@ -68,7 +68,7 @@ type httpChecker struct {
 	req    *http.Request
 }
 
-var LOG_LEVEL int = TRACE
+var LOG_LEVEL int = ERROR
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 var flukeChecker *httpChecker
@@ -327,10 +327,10 @@ func parse() {
 				if parsed != nil {
 					message.isParsed = true
 					if LOG_LEVEL >= DEBUG {
-						log.Printf("[MAIN] Message [%16x] successfully parsed.", message.id)
+						log.Printf("[PARSE] Message [%16x] successfully parsed.", message.id)
 						if LOG_LEVEL >= TRACE {
-							log.Printf("[MAIN] Raw Request: [% x]\n", message.rawReq)
-							log.Printf("[MAIN] Raw Response: [% x]\n", message.rawResp)
+							log.Printf("[PARSE] Raw Request: [% x]\n", message.rawReq)
+							log.Printf("[PARSE] Raw Response: [% x]\n", message.rawResp)
 						}
 					}
 					toProcess <- parsed
@@ -367,7 +367,7 @@ func ingest() {
 			if !isPresent {
 				log.Println(SEP)
 			}
-			log.Printf("[INGEST] %s - NEW RECORD - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, rawId, pid, rawPid, rawFd)
+			log.Printf("[INGEST] %s - NEW RECORD (%d B) - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, len(payload), rawId, pid, rawPid, rawFd)
 			if LOG_LEVEL >= TRACE {
 				log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, payload)
 			}
@@ -411,7 +411,7 @@ func ingest() {
 				toParse <- message
 				delete(messages, id)
 				if LOG_LEVEL >= TRACE {
-					log.Printf("[MAIN] Message [%016x] removed from messages map.", id)
+					log.Printf("[INGEST] Message [%016x] removed from messages map.", id)
 				}
 			}
 		} else if isReq {
@@ -544,7 +544,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 
 		// Bodies
 
-		if LOG_LEVEL >= DEBUG {
+		if LOG_LEVEL >= TRACE {
 			log.Printf("[PARSE] Request body: % x\n", req[2])
 			log.Printf("[PARSE] Response body: % x\n", resp[2])
 		}
@@ -711,18 +711,20 @@ func process() {
 				log.Println("[PROCESS] Interval: ", message.interval)
 				log.Printf("[PROCESS] Message is HTTP2: %v\n", message.isHttp2)
 
-				body, err := io.ReadAll(message.httpReq.Body)
-				if err == nil {
-					log.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
-					message.httpReq.Body.Close()
-					message.httpReq.Body = io.NopCloser(bytes.NewReader(body))
-				}
+				if LOG_LEVEL >= TRACE {
+					body, err := io.ReadAll(message.httpReq.Body)
+					if err == nil {
+						log.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
+						message.httpReq.Body.Close()
+						message.httpReq.Body = io.NopCloser(bytes.NewReader(body))
+					}
 
-				body, err = io.ReadAll(message.httpResp.Body)
-				if err == nil {
-					log.Printf("[PROCESS] Response body %v:\n%s\n", message.httpResp.Body, body)
-					message.httpResp.Body.Close()
-					message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
+					body, err = io.ReadAll(message.httpResp.Body)
+					if err == nil {
+						log.Printf("[PROCESS] Response body %v:\n%s\n", message.httpResp.Body, body)
+						message.httpResp.Body.Close()
+						message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
+					}
 				}
 			}
 			if isFlukeReachable() {

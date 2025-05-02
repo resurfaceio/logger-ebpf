@@ -18,7 +18,6 @@
 #define TRACE_CLOSED        0x000000F0
 #define TRACE_SSL_CONNECTED 0x00000F00
 #define TRACE_SSL_CLOSED    0x0000F000
-#define TRACE_SSL_AJAR      0x0000C000
 #define TRACE_MASK          0xF0000000
 #define TRACE_FLAGS_OP_AND  1
 #define TRACE_FLAGS_OP_OR   2
@@ -31,11 +30,12 @@
 #define WRITE_OP            1
 
 #define ZERO                0
-#define MAX_U32_VALUE       0xFFFFFFFF  // max u32 = (255) + (255 << 8) + (255 << 16) + (255 << 24) = 4294967295
+#define MAX_U32_VALUE       0xFFFFFFFF
 
-#define MAX_BYTES           512
-#define MAX_ITERATIONS      50
-#define RINGBUF_SIZE        4194304
+#define MAX_BYTES           163840     // max  160 kiB per iteration
+#define MAX_ITERATIONS      50         // max 8000 kiB per payload
+#define RINGBUF_SIZE        8388608    // max 8192 kiB per ringbuf (= max 16 MiB capacity per HTTPS message)
+
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
 #define LOG_LEVEL           LOG_DEBUG
@@ -170,15 +170,28 @@ static int min(int a, int b) {
     return b;
 }
 
-
-
-
-static long enforce_bounds(long i, long lower, long upper) {
-    if (i < lower) i = lower;
-    if (i > upper) i = upper;
-    return i;
+/**
+ * @name enforce_bounds
+ * @brief Constrains an long integer within a given range.
+ * @param n long integer to constrain.
+ * @param lower smallest possible value in the allowed range.
+ * @param upper largest possible value in the allowed range.
+ * @return n if lower < n < upper. Otherwise, the nearest bound is enforced.
+ */
+static long enforce_bounds(long n, long lower, long upper) {
+    if (n < lower) n = lower;
+    if (n > upper) n = upper;
+    return n;
 }
 
+/**
+ * @name enforce_bounds_int
+ * @brief Constrains an integer within a given range.
+ * @param i integer to constrain.
+ * @param lower smallest possible value in the allowed range.
+ * @param upper largest possible value in the allowed range.
+ * @return i if lower < n < upper. Otherwise, the nearest bound is enforced.
+ */
 static int enforce_bounds_int(int i, int lower, int upper) {
     return (int) enforce_bounds((long) i, (long) lower, (long) upper);
 }
@@ -441,14 +454,15 @@ static int SSL_entry(void *buf, int rw) {
  * @param ctx Pointer to eBPF context variable
  * @param rw  Flag to indicate type of operation
  * 
- * @return Propagates return value (casted to int) from bpf_ringbuf_output (0 on success, or a negative value in case of failure).
+ * @return 0 on success, or a positive value in case of failure.
  * 
  * @retval 0 if data was successfully retrieved from buffer and submitted to output ringbuf.
  * @retval 1 if the underlying network calls are not being traced (trace is NULL).
  * @retval 2 if the underlying network connection does not exist (trace is NOT connected).
  * @retval 3 if the number of bytes read/written specified by the function rc is invalid.
  * @retval 4 if data couldn't be read from the stashed buffer.
- * @retval 5 if the operation specified by rw isn't supported.
+ * @retval 5 if data couldn't be submitted to the output ringbuf.
+ * @retval 6 if the operation specified by rw isn't supported.
  */
 static int SSL_exit(struct pt_regs *ctx, int rw) {
     u64 id = bpf_get_current_pid_tgid();
@@ -483,57 +497,42 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
     }
 
     fd = trace->fd;
-    printk(LOG_DEBUG, "SSL_exit", "message ready for ringbuf");
 
-    int rc = 0;
     u64 packaged_size = sizeof(struct data_t);
     if (rw == READ_OP) {
-        rdata.id = tgid;
-        rdata.fd = fd;
+        buf = (char *) (trace->readsbp);
     } else if (rw == WRITE_OP) {
-        wdata.id = tgid;
-        wdata.fd = fd;
+        buf = (char *) (trace->writesbp);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
-        return 5;
+        return 6;
     }
 
     for (int i = 0; i < min(n, MAX_ITERATIONS); i++) {
-        if (rw == READ_OP) {
-            buf = (char *) ((trace->readsbp) + (i * MAX_BYTES));
-            if (i == n - 1) {
-                data_size = byte_count - (i * MAX_BYTES);
-            }
-            data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
+        buf = (char *) (buf + (i * MAX_BYTES));
+        if (i == n - 1) {
+            data_size = byte_count - (i * MAX_BYTES);
+        }
+        data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
+        packaged_size = enforce_bounds(packaged_size - MAX_BYTES + data_size, 0, sizeof(struct data_t));
 
-            if (bpf_probe_read_user(&rdata.data, data_size, buf) < 0) {
-                return 4;
-            }
-            packaged_size = packaged_size - MAX_BYTES + data_size;
-            packaged_size = enforce_bounds(packaged_size, 0, sizeof(struct data_t));
-            rc |= (int) bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
-            if (rc != 0) {
-                return rc;
-            }
+        if (rw == READ_OP) {
+            rdata.id = tgid;
+            rdata.fd = fd;
+            if (bpf_probe_read_user(&rdata.data, data_size, buf) < 0) return 4;
+            if (bpf_ringbuf_output(&reads, &rdata, packaged_size, 0) < 0) return 5;
+        } else if (rw == WRITE_OP) {
+            wdata.id = tgid;
+            wdata.fd = fd;
+            if (bpf_probe_read_user(&wdata.data, data_size, buf) < 0) return 4;
+            if (bpf_ringbuf_output(&writes, &wdata, packaged_size, 0) < 0) return 5;
         } else {
-            buf = (char *) ((trace->writesbp) + (i * MAX_BYTES));
-            if (i == n - 1) {
-                data_size = byte_count - (i * MAX_BYTES);
-            }
-            data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
-            if (bpf_probe_read_user(&wdata.data, data_size, buf) < 0) {
-                return 4;
-            }
-            packaged_size = packaged_size - MAX_BYTES + data_size;
-            packaged_size = enforce_bounds(packaged_size, 0, sizeof(struct data_t));
-            rc |= (int) bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
-            if (rc != 0) {
-                return rc;
-            }
+            printk(LOG_ERROR, "SSL_exit", "unsupported operation");
+            return 6;
         }
     }
 
-    return rc;
+    return 0;
 }
 
 static int entry_accept(int fd, int is_accept4) {
@@ -763,7 +762,7 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
     }
 
     if (poison_well() == 0) {
-        printk(LOG_DEBUG, "uprobe/SSL_shutdown", " poison pill sent.");
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", "poison pill sent.");
     }
     if (delete_trace() == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_shutdown", "trace deleted successfully.");
