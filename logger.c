@@ -32,9 +32,9 @@
 #define ZERO                0
 #define MAX_U32_VALUE       0xFFFFFFFF
 
-#define MAX_BYTES           163840     // max  160 kiB per iteration
-#define MAX_ITERATIONS      50         // max 8000 kiB per payload
-#define RINGBUF_SIZE        8388608    // max 8192 kiB per ringbuf (= max 16 MiB capacity per HTTPS message)
+#define MAX_BYTES           1048576    // max  1 MiB per iteration
+#define MAX_ITERATIONS      8          // max  8 MiB per HTTPS payload
+#define RINGBUF_SIZE        16777216   // max 16 MiB per ringbuf (32 MiB in total for both req and resp)
 
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
@@ -194,6 +194,19 @@ static long enforce_bounds(long n, long lower, long upper) {
  */
 static int enforce_bounds_int(int i, int lower, int upper) {
     return (int) enforce_bounds((long) i, (long) lower, (long) upper);
+}
+
+/**
+ * @name cat2long
+ * @brief Concatenate two integers into a long integer.
+ * @param lower integer to concatenate in the lower half of the return value.
+ * @param upper integer to concatenate in the upper half of the return value.
+ * @return long integer of the form: [upper|lower]
+ */
+static long cat2long(int lower, int upper) {
+    long c = upper;
+    c <<= (sizeof(int) * 8);
+    return c | lower;
 }
 
 /**
@@ -464,17 +477,18 @@ static int SSL_entry(void *buf, int rw) {
  * @retval 5 if data couldn't be submitted to the output ringbuf.
  * @retval 6 if the operation specified by rw isn't supported.
  */
-static int SSL_exit(struct pt_regs *ctx, int rw) {
+static long SSL_exit(struct pt_regs *ctx, int rw) {
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = (u32) id;
     u32 tgid = id >> 32;
     u32 fd;
     char *buf;
+    long errno;
 
     int byte_count = PT_REGS_RC(ctx);
     if (byte_count <= 0) {
         printk(LOG_DEBUG, "SSL_exit", "byte_count <= 0");
-        return 3;
+        return cat2long(3, byte_count);
     }
     
     int n = 1;
@@ -505,7 +519,7 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
         buf = (char *) (trace->writesbp);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
-        return 6;
+        return cat2long(6, rw);
     }
 
     for (int i = 0; i < min(n, MAX_ITERATIONS); i++) {
@@ -519,16 +533,20 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
         if (rw == READ_OP) {
             rdata.id = tgid;
             rdata.fd = fd;
-            if (bpf_probe_read_user(&rdata.data, data_size, buf) < 0) return 4;
-            if (bpf_ringbuf_output(&reads, &rdata, packaged_size, 0) < 0) return 5;
+            errno = bpf_probe_read_user(&rdata.data, data_size, buf);
+            if (errno < 0) return cat2long(4, (int) errno);
+            errno = bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
+            if (errno < 0) return cat2long(5, (int) errno);
         } else if (rw == WRITE_OP) {
             wdata.id = tgid;
             wdata.fd = fd;
-            if (bpf_probe_read_user(&wdata.data, data_size, buf) < 0) return 4;
-            if (bpf_ringbuf_output(&writes, &wdata, packaged_size, 0) < 0) return 5;
+            errno = bpf_probe_read_user(&wdata.data, data_size, buf);
+            if (errno < 0) return cat2long(4, (int) errno);
+            errno = bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
+            if (errno < 0) return cat2long(5, (int) errno);
         } else {
             printk(LOG_ERROR, "SSL_exit", "unsupported operation");
-            return 6;
+            return cat2long(6, rw);
         }
     }
 
@@ -800,7 +818,11 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
         }
     }
 
-    return (SSL_exit(ctx, READ_OP));
+    long re = SSL_exit(ctx, READ_OP);
+    const static char m1[] = "[DEBUG] [uretprobe/SSL_read    ]: SSL_exit rc: %d, errno: %d";
+    bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
+
+    return (int) re;
 }
 
 SEC("uretprobe/SSL_write")
@@ -814,7 +836,11 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
         }
     }
 
-    return (SSL_exit(ctx, WRITE_OP));
+    long re = SSL_exit(ctx, WRITE_OP);
+    const static char m1[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit rc: %d, errno: %d";
+    bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
+
+    return (int) re;
 }
 
 char __license[] SEC("license") = "GPL v2";

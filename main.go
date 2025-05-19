@@ -30,6 +30,7 @@ const (
 	INFO
 	DEBUG
 	TRACE
+	TRALL
 )
 
 const POISON uint64 = 0x8D0003048D0304F0
@@ -63,15 +64,9 @@ type rawRecord struct {
 	isReq bool
 }
 
-type httpChecker struct {
-	client *http.Client
-	req    *http.Request
-}
-
 var LOG_LEVEL int = ERROR
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
-var flukeChecker *httpChecker
 
 var messages map[uint64]*rawMessage
 var toIngest chan *rawRecord
@@ -87,18 +82,6 @@ func getNanoKtime() uint64 {
 	}
 
 	return uint64(unix.TimespecToNsec(ts))
-}
-
-func isFlukeReachable() bool {
-	resp, err := flukeChecker.client.Do(flukeChecker.req)
-	if err != nil {
-		if LOG_LEVEL >= ERROR {
-			log.Println("error: ", err)
-		}
-	} else if resp != nil && resp.StatusCode == 204 {
-		return true
-	}
-	return false
 }
 
 func main() {
@@ -181,30 +164,14 @@ func main() {
 		return
 	}
 
-	flukeUrl := os.Getenv("USAGE_LOGGERS_URL")
-	flukeChecker = &httpChecker{
-		client: &http.Client{},
-	}
-	flukeChecker.req, err = http.NewRequest("POST", flukeUrl, bytes.NewBuffer([]byte("")))
-	if err != nil {
-		if LOG_LEVEL >= ERROR {
-			log.Println("error creating fluke checker: ", err)
-		}
-		return
-	} else {
-		flukeChecker.req.Header.Set("Content-Type", "application/ndjson; charset=UTF-8")
-		logger.GetUsageLoggers()
-		flukeChecker.req.Header.Set("User-Agent", "Resurface/0.1 (test)")
-	}
-
-	if !isFlukeReachable() && LOG_LEVEL >= WARN {
+	if !l.IsFlukeReachable() && LOG_LEVEL >= WARN {
 		log.Println("warning: not able to reach fluke during logger initialization")
 	}
 
 	if LOG_LEVEL >= INFO {
 		log.Println("logger is initialized")
 		if LOG_LEVEL >= DEBUG {
-			log.Println("  url:   ", flukeUrl)
+			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
 			log.Println("  rules: ", opts.Rules)
 		}
 		log.Println("Waiting for any OpenSSL calls...")
@@ -320,15 +287,15 @@ func readRing(reader *ringbuf.Reader, fromReads bool, isClient bool) {
 func parse() {
 	for message := range toParse {
 		if !message.isParsed && len(message.rawReq) != 0 && len(message.rawResp) != 0 {
-			var isFinished bool
+			var done bool
 			var parsed *parsedMessage
-			for !isFinished {
-				parsed, isFinished = parseFirstFound(message)
+			for !done {
+				parsed, done = parseFirstFound(message)
 				if parsed != nil {
 					message.isParsed = true
 					if LOG_LEVEL >= DEBUG {
 						log.Printf("[PARSE] Message [%16x] successfully parsed.", message.id)
-						if LOG_LEVEL >= TRACE {
+						if LOG_LEVEL >= TRALL {
 							log.Printf("[PARSE] Raw Request: [% x]\n", message.rawReq)
 							log.Printf("[PARSE] Raw Response: [% x]\n", message.rawResp)
 						}
@@ -368,7 +335,7 @@ func ingest() {
 				log.Println(SEP)
 			}
 			log.Printf("[INGEST] %s - NEW RECORD (%d B) - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, len(payload), rawId, pid, rawPid, rawFd)
-			if LOG_LEVEL >= TRACE {
+			if LOG_LEVEL >= TRALL {
 				log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, payload)
 			}
 		}
@@ -545,8 +512,11 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 		// Bodies
 
 		if LOG_LEVEL >= TRACE {
-			log.Printf("[PARSE] Request body: % x\n", req[2])
-			log.Printf("[PARSE] Response body: % x\n", resp[2])
+			log.Printf("[PARSE] Body lengths (req, resp): (%d, %d)\n", len(req[2]), len(resp[2]))
+			if LOG_LEVEL >= TRALL {
+				log.Printf("[PARSE] Request body: % x\n", req[2])
+				log.Printf("[PARSE] Response body: % x\n", resp[2])
+			}
 		}
 
 		// Wrap it up
@@ -585,7 +555,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 				label = "RESP"
 			}
 			for _, frame := range toFrames(raw) {
-				if LOG_LEVEL >= TRACE {
+				if LOG_LEVEL >= TRALL {
 					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
 					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
 						label,
@@ -659,11 +629,14 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 					}
 
 					if LOG_LEVEL >= DEBUG {
-						log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
+						log.Printf("[PARSE] %s - DATA LENGTH: %d\n", label, len(frame._data))
+						if LOG_LEVEL >= TRALL {
+							log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
+						}
 					}
 				}
 
-				if LOG_LEVEL >= TRACE {
+				if LOG_LEVEL >= TRALL {
 					log.Println(SEP)
 				}
 			}
@@ -711,7 +684,7 @@ func process() {
 				log.Println("[PROCESS] Interval: ", message.interval)
 				log.Printf("[PROCESS] Message is HTTP2: %v\n", message.isHttp2)
 
-				if LOG_LEVEL >= TRACE {
+				if LOG_LEVEL >= TRALL {
 					body, err := io.ReadAll(message.httpReq.Body)
 					if err == nil {
 						log.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
@@ -727,7 +700,7 @@ func process() {
 					}
 				}
 			}
-			if isFlukeReachable() {
+			if l.IsFlukeReachable() {
 				logger.SendHttpMessage(l, &message.httpResp, &message.httpReq, message.responseMillis, message.interval, nil)
 			} else {
 				if LOG_LEVEL >= ERROR {
