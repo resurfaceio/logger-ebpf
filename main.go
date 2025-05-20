@@ -85,7 +85,7 @@ func getNanoKtime() uint64 {
 }
 
 func main() {
-	defer log.Println("Thanks for using Graylog! Bye 👋")
+	defer log.Println("Thanks for using Graylog! 👋")
 
 	if level, err := strconv.Atoi(os.Getenv("USAGE_LOGGERS_EBPF_LOG_LEVEL")); err == nil {
 		if level < NOLOG {
