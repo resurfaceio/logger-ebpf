@@ -25,7 +25,7 @@ func earlyClose(closers *[]closer) {
 			}
 		}
 	} else {
-		log.Println("ebpf programs loaded successfully!")
+		log.Println("eBPF programs loaded successfully.")
 	}
 }
 
@@ -35,7 +35,8 @@ func load(exPath string, isClient bool) []closer {
 	// Remove resource limits for kernels <5.11.
 	//---------------------------------------------------------
 	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatal("Removing memlock:", err)
+		log.Println("Removing memlock:", err)
+		log.Fatal("Unable to load eBPF programs. Please make sure that you have the right permissions to make bpf() calls.")
 	}
 
 	// Load the compiled eBPF ELF and load it into the kernel.

@@ -85,7 +85,7 @@ func getNanoKtime() uint64 {
 }
 
 func main() {
-	defer log.Println("All done. Bye!")
+	defer log.Println("Thanks for using Graylog! Bye 👋")
 
 	if level, err := strconv.Atoi(os.Getenv("USAGE_LOGGERS_EBPF_LOG_LEVEL")); err == nil {
 		if level < NOLOG {
@@ -103,7 +103,7 @@ func main() {
 	}
 
 	if LOG_LEVEL >= DEBUG {
-		log.Println("executable: ", exPath)
+		log.Println("Executable: ", exPath)
 	}
 
 	// Load programs
@@ -165,16 +165,18 @@ func main() {
 	}
 
 	if !l.IsFlukeReachable() && LOG_LEVEL >= WARN {
-		log.Println("warning: not able to reach fluke during logger initialization")
+		log.Println("warning: could not reach fluke during logger initialization")
+	} else if LOG_LEVEL >= INFO {
+		log.Println("Graylog fluke server is reachable.")
 	}
 
 	if LOG_LEVEL >= INFO {
-		log.Println("logger is initialized")
+		log.Println("HTTPS logger is initialized.")
 		if LOG_LEVEL >= DEBUG {
 			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
 			log.Println("  rules: ", opts.Rules)
 		}
-		log.Println("Waiting for any OpenSSL calls...")
+		log.Println("Waiting for any HTTPS payloads from OpenSSL calls...")
 	}
 
 	go process()

@@ -12,18 +12,20 @@ There are many different Linux distributions and kernel versions, so the first t
 
 These output messages indicate that the logger is running successfully:
 ```text
-2025/04/23 16:34:38 main.go:104: executable:  /lib/x86_64-linux-gnu/libssl.so.3
-2025/04/23 16:34:38 loader.go:28:  programs loaded successfully!
-2025/04/23 16:34:38 main.go:165: logger is initialized
-2025/04/23 16:34:38 main.go:167:   url:    https://<your Graylog API Security instance>/fluke/message
-2025/04/23 16:34:38 main.go:168:   rules:  include debug
-2025/04/23 16:34:38 main.go:170: Waiting for any OpenSSL calls...
+2025/05/20 15:29:15 main.go:106: Executable:  /lib/x86_64-linux-gnu/libssl.so.3
+2025/05/20 15:29:16 loader.go:28: eBPF programs loaded successfully.
+2025/05/20 15:29:16 main.go:170: Graylog fluke server is reachable.
+2025/05/20 15:29:16 main.go:174: HTTPS logger is initialized.
+2025/05/20 15:29:16 main.go:176:   url:    https://<your Graylog API Security instance>/fluke/message
+2025/05/20 15:29:16 main.go:177:   rules:  include debug
+2025/05/20 15:29:16 main.go:179: Waiting for any HTTPS payloads from OpenSSL calls...
 ```
 
 These output messages indicate that the logger was not run with required root permissions:
 ```text
-2025/04/23 16:42:31 main.go:104: executable:  /lib/x86_64-linux-gnu/libssl.so.3
-2025/04/23 16:42:31 loader.go:38: Removing memlock:failed to set memlock rlimit: operation not permitted
+2025/05/20 16:13:45 main.go:106: Executable:  /lib/x86_64-linux-gnu/libssl.so.3
+2025/05/20 16:13:45 loader.go:38: Removing memlock: failed to set memlock rlimit: operation not permitted
+2025/05/20 16:13:45 loader.go:39: Unable to load eBPF programs. Please make sure that you have the right permissions to make bpf() calls.
 ```
 
 If the logger fails to start, check that the kernel version is 5.8 or later:
