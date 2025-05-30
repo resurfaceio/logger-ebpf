@@ -54,36 +54,6 @@ func load(exPath string, isClient bool) []closer {
 
 	//---------------------------------------------------------
 
-	// Attach kprobes and kretprobes
-
-	if !isClient {
-		kAccept, err := link.Kprobe("sys_accept", objs.EntrySysAccept, nil)
-		if err != nil {
-			log.Panicln("error: Attaching sys_accept kprobe:", err)
-		}
-		closers = append(closers, kAccept)
-
-		kretAccept, err := link.Kretprobe("sys_accept", objs.RetSysAccept, nil)
-		if err != nil {
-			log.Panicln("error: Attaching sys_accept kretprobe:", err)
-		}
-		closers = append(closers, kretAccept)
-
-		kAccept4, err := link.Kprobe("sys_accept4", objs.EntrySysAccept4, nil)
-		if err != nil {
-			log.Panicln("error: Attaching sys_accept4 kprobe:", err)
-		}
-		closers = append(closers, kAccept4)
-
-		kretAccept4, err := link.Kretprobe("sys_accept4", objs.RetSysAccept4, nil)
-		if err != nil {
-			log.Panicln("error: Attaching sys_accept4 kretprobe:", err)
-		}
-		closers = append(closers, kretAccept4)
-	}
-
-	//---------------------------------------------------------
-
 	// Attach uprobes and uretprobes to executable.
 
 	ex, err := link.OpenExecutable(exPath)

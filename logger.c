@@ -32,13 +32,13 @@
 #define ZERO                0
 #define MAX_U32_VALUE       0xFFFFFFFF
 
-#define MAX_BYTES           1048576    // max  1 MiB per iteration
-#define MAX_ITERATIONS      8          // max  8 MiB per HTTPS payload
-#define RINGBUF_SIZE        16777216   // max 16 MiB per ringbuf (32 MiB in total for both req and resp)
+#define MAX_BYTES           16384    // max 16 kiB per iteration
+#define MAX_ITERATIONS      512      // max  8 MiB per HTTPS payload
+#define RINGBUF_SIZE        16777216 // max 16 MiB per ringbuf (32 MiB in total for both req and resp)
 
 #define POISON              0x8D0003048D0304F0
 #define INVALID_FD          MAX_U32_VALUE
-#define LOG_LEVEL           LOG_DEBUG
+#define LOG_LEVEL           LOG_TRACE
 
 /**
  * 
@@ -55,38 +55,44 @@
  *              struct keeps track of its initialization time as a u64 timestamp,
  *              as well as references to two buffers: reads, and writes.
  * 
- * [ fd (32) | flags (32) | ts (64) | readsbp (64) | writesbp (64) ]
+ * [  sslp (64) | fd (32) [DEPRECATED] | flags (32) | created_at (64) | rbuf (64) | wbuf (64) ]
  */
 struct trace_t {
+    u64 sslp;
     u32 fd;
     u32 flags;  // 0x0000 00ba where a: connected, b: closed
-    u64 ts;
-    uintptr_t readsbp;
-    uintptr_t writesbp;
+    u64 created_at;
+    uintptr_t rbuf;
+    uintptr_t wbuf;
 };
 
 /**
  * Data package
- * Descrption: package with data to be sent to application in userspace through eBPF maps.
- * [ id (32) | fd (32) | data (MAX_BYTES)]
+ * Descrption: package with char data to be sent to application in userspace through eBPF maps.
+ * [ length (64) | pid_tgid (64) | sslp (64) | ts (64) | data (MAX_BYTES)]
  */
 struct data_t {
-    u32 id;
-    u32 fd;
+    u64 len;
+    u64 pid;
+    u64 sslp;
+    u64 ts;
     char data[MAX_BYTES];
 };
 
+/**
+ * Pill package
+ * Descrption: package with a single u64 member to be sent to application in userspace through eBPF maps.
+ * [ data_len (64) | pid_tgid (64) | sslp (64) | ts (64) | pill (64) ]
+ */
+struct pill_t {
+    u64 len;
+    u64 pid;
+    u64 sslp;
+    u64 ts;
+    u64 pill;
+};
+
 const struct trace_t *unused __attribute__((unused));  // auto generates a given Go type with bpfgo
-
-/**
- * 
- * Variable declarations
- */
-
-/**
- * Packaged data
- */
-struct data_t rdata, wdata;
 
 
 /**
@@ -111,7 +117,6 @@ struct {
     __type(value, struct trace_t);
     __uint(max_entries, 100);
 } traces SEC(".maps");
-
 
 /**
  *
@@ -219,37 +224,35 @@ static long cat2long(int lower, int upper) {
  * @name init_trace
  * @brief Initializes a trace with the current given pid+tgid, and a given file descriptor.
  * 
- * @param fd Socket file descriptor to trace.
- * @param create_only Set to 1 if an existing trace is NOT to be updated. Set to 0 if an existing trace can be reinitialized.
+ * @param *SSL Connection to trace.
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  */
-static long init_trace(int fd, int create_only) {
+static long init_trace(u64 ssl) {
     u64 exists;
     u64 id = bpf_get_current_pid_tgid();
     u64 ktime = bpf_ktime_get_ns();
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace != NULL) {
-        if (create_only != 0) {
-            return 0;
-        };
-        trace->flags    = (u32) ZERO;
-        trace->readsbp  = (uintptr_t) ZERO;
-        trace->writesbp = (uintptr_t) ZERO;
+        trace->fd    = (u32) INVALID_FD;
+        trace->flags = (u32) ZERO;
+        trace->rbuf  = (uintptr_t) ZERO;
+        trace->wbuf  = (uintptr_t) ZERO;
 
         exists = BPF_EXIST;
     } else {
         struct trace_t new_trace = {
-            .flags      = (u32) ZERO,
-            .readsbp    = (uintptr_t) ZERO,
-            .writesbp   = (uintptr_t) ZERO,
+            .fd    = (u32) INVALID_FD,
+            .flags = (u32) ZERO,
+            .rbuf  = (uintptr_t) ZERO,
+            .wbuf  = (uintptr_t) ZERO,
         };
         trace = &new_trace;
 
         exists = BPF_NOEXIST;
     }
 
-    trace->ts = ktime;
-    trace->fd = (u32) fd;
+    trace->created_at = ktime;
+    trace->sslp  = ssl;
 
     return bpf_map_update_elem(&traces, &id, trace, exists);
 }
@@ -430,7 +433,7 @@ static long update_trace_flags(int operation, u32 operand) {
  * @retval 2 if the underlying network connection does not exist (trace is NOT connected).
  * @retval 3 if the operation specified by rw isn't supported.
  */
-static int SSL_entry(void *buf, int rw) {
+static int SSL_entry(void* ssl, void *buf, int rw) {
     u64 id = bpf_get_current_pid_tgid();
 
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
@@ -444,10 +447,15 @@ static int SSL_entry(void *buf, int rw) {
         return 2;
     }
 
+    if (trace->sslp != (u64) ssl) {
+        printk(LOG_TRACE, "SSL_entry", "wrong SSL pointer!");
+        return 1;
+    }
+
     if (rw == READ_OP) {
-        trace->readsbp = (uintptr_t) buf;
+        trace->rbuf = (uintptr_t) buf;
     } else if (rw == WRITE_OP) {
-        trace->writesbp = (uintptr_t) buf;
+        trace->wbuf = (uintptr_t) buf;
     } else {
         printk(LOG_ERROR, "SSL_entry", "unsupported operation");
         return 3;
@@ -478,10 +486,8 @@ static int SSL_entry(void *buf, int rw) {
  * @retval 6 if the operation specified by rw isn't supported.
  */
 static long SSL_exit(struct pt_regs *ctx, int rw) {
+    u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
-    u32 pid = (u32) id;
-    u32 tgid = id >> 32;
-    u32 fd;
     char *buf;
     long errno;
 
@@ -510,13 +516,12 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
         return 2;
     }
 
-    fd = trace->fd;
+    u64 sslp = trace->sslp;
 
-    u64 packaged_size = sizeof(struct data_t);
     if (rw == READ_OP) {
-        buf = (char *) (trace->readsbp);
+        buf = (char *) (trace->rbuf);
     } else if (rw == WRITE_OP) {
-        buf = (char *) (trace->writesbp);
+        buf = (char *) (trace->wbuf);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
         return cat2long(6, rw);
@@ -528,87 +533,37 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
             data_size = byte_count - (i * MAX_BYTES);
         }
         data_size = enforce_bounds_int(data_size, 0, MAX_BYTES);
-        packaged_size = enforce_bounds(packaged_size - MAX_BYTES + data_size, 0, sizeof(struct data_t));
 
+        struct data_t *allotted;
         if (rw == READ_OP) {
-            rdata.id = tgid;
-            rdata.fd = fd;
-            errno = bpf_probe_read_user(&rdata.data, data_size, buf);
-            if (errno < 0) return cat2long(4, (int) errno);
-            errno = bpf_ringbuf_output(&reads, &rdata, packaged_size, 0);
-            if (errno < 0) return cat2long(5, (int) errno);
+            allotted = bpf_ringbuf_reserve(&reads, sizeof(struct data_t), 0);
+            if (allotted == NULL) return 4;
         } else if (rw == WRITE_OP) {
-            wdata.id = tgid;
-            wdata.fd = fd;
-            errno = bpf_probe_read_user(&wdata.data, data_size, buf);
-            if (errno < 0) return cat2long(4, (int) errno);
-            errno = bpf_ringbuf_output(&writes, &wdata, packaged_size, 0);
-            if (errno < 0) return cat2long(5, (int) errno);
+            allotted = bpf_ringbuf_reserve(&writes, sizeof(struct data_t), 0);
+            if (allotted == NULL) return 4;
         } else {
             printk(LOG_ERROR, "SSL_exit", "unsupported operation");
             return cat2long(6, rw);
         }
-    }
 
-    return 0;
-}
-
-static int entry_accept(int fd, int is_accept4) {
-    if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m[] = "[DEBUG] [kprobe/sys_accept%s    ]: attempting connection with socket fd: %d [%x]";
-        bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
-    }
-
-    long rc = init_trace(fd, 0);
-    
-    if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m[] = "[DEBUG] [kprobe/sys_accept%s    ]: init_trace rc: %d";
-        bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", rc);
-    }
-
-    return 0;
-}
-
-static int exit_accept(int fd, int is_accept4) {
-    if (LOG_LEVEL >= LOG_TRACE) {
-        const static char m[] = "[TRACE] [kretprobe/sys_accept%s ]: new fd: %d [%x]";
-        bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
-    }
-
-    if (fd < 0) {
-        if (LOG_LEVEL >= LOG_DEBUG) {
-            const static char m[] = "[DEBUG] [kretprobe/sys_accept%s ]: failed to establish connection. Return code: %d [%x]";
-            bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", fd, fd);
+        allotted->pid = id;
+        allotted->sslp = sslp;
+        allotted->ts = ktime;
+        allotted->len = sizeof(struct data_t) + (u64) (data_size - MAX_BYTES);
+        errno = bpf_probe_read_user(allotted->data, data_size, buf);
+        if (errno < 0) {
+            bpf_ringbuf_discard(allotted, 0);
+            return cat2long(4, (int) errno);
         }
 
-        delete_trace();
-
-    } else {
-        if (LOG_LEVEL >= LOG_INFO) {
-            const u64 id = bpf_get_current_pid_tgid();
-            const static char m[] = "[INFO ] [kretprobe/sys_accept%s ]: connection established for PID %d and FD [%x].";
-            bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", id, fd);
-        }
-        
-        const long retval = update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_CONNECTED);
-
-        if (LOG_LEVEL != LOG_DISABLED && retval !=0) {
-            if (retval == 1) {
-                printk(LOG_TRACE, "kretprobe/sys_accept", "[update_trace_flags] trace is NULL");
-            } else if (retval == 2) {
-                printk(LOG_ERROR, "kretprobe/sys_accept", "[update_trace_flags] unsupported operation");
-            } else if (LOG_LEVEL >= LOG_DEBUG) {
-                const static char m[] = "[DEBUG] [kretprobe/sys_accept%s ]: [update_trace_flags] bpf_map_update: %d";
-                bpf_trace_printk(m, sizeof(m), is_accept4 == 1 ? "4" : " ", retval);
-            }
-        }
+        bpf_ringbuf_submit(allotted, 0);
     }
+
     return 0;
 }
 
 static int poison_well() {
-    const static u64 pill = POISON;
-
+    u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
 
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
@@ -616,68 +571,36 @@ static int poison_well() {
         printk(LOG_TRACE, "poison_well", "trace is NULL");
         return 1;
     }
-    u64 fd = (u64) trace->fd;
     
-    u128 packaged = pill;
-    packaged = (packaged << 64) | (fd << 32) | (id >> 32);
-    
+    struct pill_t package = {
+        .len = sizeof(u64),
+        .pid  = id,
+        .sslp = trace->sslp,
+        .ts   = ktime,
+        .pill = (u64) POISON,
+    };
     printk(LOG_DEBUG, "poison_well", "pill ready for ringbuf");
 
-    int r = (int) bpf_ringbuf_output(&reads, &packaged, sizeof(u128), 0);
-    int w = (int) bpf_ringbuf_output(&writes, &packaged, sizeof(u128), 0);
+    u64 package_size = sizeof(struct pill_t);
+    void *allotted = bpf_ringbuf_reserve(&reads, package_size, 0);
+    if (allotted == NULL) return 2;
+    int errno = bpf_probe_read_kernel(allotted, package_size, &package);
+    if (errno) {
+        bpf_ringbuf_discard(allotted, 0);
+        return errno;
+    }
+    bpf_ringbuf_submit(allotted, 0);
 
-    return r || w;
-}
+    allotted = bpf_ringbuf_reserve(&writes, package_size, 0);
+    if (allotted == NULL) return 2;
+    errno = bpf_probe_read_kernel(allotted, package_size, &package);
+    if (errno) {
+        bpf_ringbuf_discard(allotted, 0);
+        return errno;
+    }
+    bpf_ringbuf_submit(allotted, 0);
 
-/**
- * 
- * Kernel probes
- * 
- */
-
-/**
- * 
- * Initialize trace id with fd retrieved from sys_accept/sys_accept4 calls (server mode)
- */
-
-/**
- * sys_accept
- * Function signature: int accept(int sockfd, void* addr, int addrlen);
- * Description: The accept() system call extracts the first connection request
- *              on the queue of pending connections for the listening
- *              socket sockfd, creates a new connected socket, and returns
- *              a new file descriptor referring to that socket.
- */
-
-SEC("kprobe/sys_accept")
-int BPF_KPROBE(entry_sys_accept, int sockfd, void* addr, void* addrlen) {
-    return entry_accept(sockfd, 0);
-}
-
-SEC("kretprobe/sys_accept")
-int BPF_KRETPROBE(ret_sys_accept, int fd) {
-    return exit_accept(fd, 0);
-}
-
-/**
- * sys_accept4
- * Function signature: int accept4(int sockfd, void* addr, int addrlen);
- * Description: The accept4() system call extracts the first connection request
- *              on the queue of pending connections for the listening
- *              socket sockfd, creates a new connected socket, and returns
- *              a new file descriptor referring to that socket.
- * 
- *              The accept4 is a non-standard linux extension for the accept syscall.
- */
-
-SEC("kprobe/sys_accept4")
-int BPF_KPROBE(entry_sys_accept4, int sockfd, void* addr, void* addrlen, int flags) {
-    return entry_accept(sockfd, 1);
-}
-
-SEC("kretprobe/sys_accept4")
-int BPF_KRETPROBE(ret_sys_accept4, int fd) {
-    return exit_accept(fd, 1);
+    return 0;
 }
 
 
@@ -689,13 +612,13 @@ int BPF_KRETPROBE(ret_sys_accept4, int fd) {
 
 SEC("uprobe/SSL_connect")
 int BPF_UPROBE(entry_ssl_connect, void* ssl) {
+    const u64 id = bpf_get_current_pid_tgid();
     if (LOG_LEVEL >= LOG_TRACE) {
-        const u64 id = bpf_get_current_pid_tgid();
         const static char m[] = "[TRACE] [uprobe/SSL_connect    ]: attempting to establish a connection for PID %d.";
         bpf_trace_printk(m, sizeof(m), id);
     }
 
-    if (init_trace(INVALID_FD, 1) == 0) {
+    if (init_trace((u64) ssl) == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_connect", "trace initialized successfully.");
     }
 
@@ -737,7 +660,7 @@ int BPF_UPROBE(entry_ssl_accept, void* ssl) {
         bpf_trace_printk(m, sizeof(m), id);
     }
 
-    if (init_trace(INVALID_FD, 1) == 0) {
+    if (init_trace((u64) ssl) == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_accept", "trace initialized successfully.");
     }
 
@@ -795,7 +718,7 @@ int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
         const static char m[] = "[DEBUG] [uprobe/SSL_read       ]: will attempt to read from buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
-    return (SSL_entry(buf, READ_OP));
+    return (SSL_entry(ssl, buf, READ_OP));
 }
 
 SEC("uprobe/SSL_write")
@@ -804,7 +727,7 @@ int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
         const static char m[] = "[DEBUG] [uprobe/SSL_write      ]: will attempt to write to buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
-    return (SSL_entry(buf, WRITE_OP));
+    return (SSL_entry(ssl, buf, WRITE_OP));
 }
 
 SEC("uretprobe/SSL_read")

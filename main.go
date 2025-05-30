@@ -55,8 +55,8 @@ type rawMessage struct {
 	isReqClosed  bool
 	isRespClosed bool
 	isParsed     bool
-	id           uint64
-	fd           uint32
+	id           [16]byte
+	sslp         uint64
 }
 
 type rawRecord struct {
@@ -68,7 +68,7 @@ var LOG_LEVEL int = ERROR
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 
-var messages map[uint64]*rawMessage
+var messages map[[16]byte]*rawMessage
 var toIngest chan *rawRecord
 var toParse chan *rawMessage
 var toProcess chan *parsedMessage
@@ -136,7 +136,7 @@ func main() {
 	}
 	defer writesReader.Close()
 
-	messages = make(map[uint64]*rawMessage)
+	messages = make(map[[16]byte]*rawMessage)
 	toIngest = make(chan *rawRecord)
 	toParse = make(chan *rawMessage)
 	toProcess = make(chan *parsedMessage)
@@ -225,11 +225,15 @@ func main() {
 
 			for entries.Next(&key, &value) {
 				now := getNanoKtime()
-				delta := time.Duration(now - value.Ts)
-				pid := uint32(key)
-				id := uint64(pid) | (uint64(value.Fd) << 32)
+				delta := time.Duration(now - value.CreatedAt)
+				ptgid := uint64(key)
+				// id := uint64(pid) | (uint64(value.Fd) << 32)
+				var id [16]byte
+				binary.LittleEndian.PutUint64(id[:8], ptgid)
+				binary.LittleEndian.PutUint64(id[8:16], value.Sslp)
+				pid := binary.LittleEndian.Uint32(id[:4])
 				if LOG_LEVEL >= TRACE {
-					log.Printf("[MAIN] Checking trace with ID=[%016x], PID=[%08x] (%d) and FD=[%08x], and TS=%d (now=%d)\n", id, pid, pid, value.Fd, value.Ts, now)
+					log.Printf("[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x], and TS=%d (now=%d)\n", id, ptgid, pid, value.Sslp, value.CreatedAt, now)
 					log.Printf("[MAIN] Trace flags: [%08x]", value.Flags)
 				}
 				if _, exists := messages[id]; !exists && delta > 5*time.Second {
@@ -313,30 +317,36 @@ func ingest() {
 	for record := range toIngest {
 		raw := *record.raw
 		isReq := record.isReq
-		if len(raw) < 8 {
+		if len(raw) < 32 {
 			return
 		}
 		now := time.Now()
-		rawPid := raw[:4]
-		rawFd := raw[4:8]
-		pid := binary.LittleEndian.Uint32(rawPid)
-		fd := binary.LittleEndian.Uint32(rawFd)
-		payload := raw[8:]
-		id := uint64(pid) | (uint64(fd) << 32)
-		rawId := make([]byte, 8)
-		binary.LittleEndian.PutUint64(rawId, id)
+		rawLen := raw[:8]
+		rawPid := raw[8:16]
+		rawSslp := raw[16:24]
+		rawTs := raw[24:32]
+		pid := binary.LittleEndian.Uint32(rawPid[:4])
+		sslp := binary.LittleEndian.Uint64(rawSslp)
+		ts := binary.LittleEndian.Uint64(rawTs)
+		payloadLen := binary.LittleEndian.Uint64(rawLen)
+		payload := raw[32 : 32+payloadLen]
+		// id := uint64(pid) | (uint64(fd) << 32)
+		// rawId := make([]byte, 8)
+		// binary.LittleEndian.PutUint64(rawId, id)
+		var id [16]byte
+		copy(id[:], raw[8:24])
 
 		message, isPresent := messages[id]
 
 		if LOG_LEVEL >= DEBUG {
 			t := "RESP"
 			if isReq {
-				t = "REQ"
+				t = "REQ "
 			}
 			if !isPresent {
 				log.Println(SEP)
 			}
-			log.Printf("[INGEST] %s - NEW RECORD (%d B) - TRACE ID: [%016x] (TGID: %d [%08x], FD: [%08x])\n", t, len(payload), rawId, pid, rawPid, rawFd)
+			log.Printf("[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%016x] (TGID: %d [%08x], SSL: [%016x]) - TS: %d\n", t, len(payload), id, pid, rawPid, rawSslp, ts)
 			if LOG_LEVEL >= TRALL {
 				log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, payload)
 			}
@@ -345,7 +355,7 @@ func ingest() {
 		if !isPresent {
 			message = new(rawMessage)
 			message.createdAt = now
-			message.fd = fd
+			message.sslp = sslp
 			message.id = id
 
 			if isReq {
@@ -370,7 +380,7 @@ func ingest() {
 			}
 		}
 
-		if len(payload) == 8 && binary.LittleEndian.Uint64(payload) == POISON {
+		if payloadLen == 8 && binary.LittleEndian.Uint64(payload) == POISON {
 			if isReq {
 				message.isReqClosed = true
 			} else {
