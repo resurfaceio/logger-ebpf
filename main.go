@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"time"
 
+	"ebpf-logger/helpers"
+
 	"github.com/cilium/ebpf/ringbuf"
 	logger "github.com/resurfaceio/logger-go/v3"
 	"golang.org/x/net/http2"
@@ -36,6 +38,9 @@ const (
 const POISON uint64 = 0x8D0003048D0304F0
 
 const SEP string = "🗣️ 📢 🔥🔥🔥"
+const INGEST_NEW_MESSAGE = "[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - KUPTIME: %d\n"
+const INGEST_NEW_MESSAGE_RAW = "[INGEST] %s - RAW RECORD: % x\n"
+const MAIN_TRACE_CHECK = "[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n"
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -55,7 +60,7 @@ type rawMessage struct {
 	isReqClosed  bool
 	isRespClosed bool
 	isParsed     bool
-	id           [16]byte
+	id           [20]byte
 	sslp         uint64
 }
 
@@ -68,7 +73,7 @@ var LOG_LEVEL int = ERROR
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 
-var messages map[[16]byte]*rawMessage
+var messages map[[20]byte]*rawMessage
 var toIngest chan *rawRecord
 var toParse chan *rawMessage
 var toProcess chan *parsedMessage
@@ -136,7 +141,7 @@ func main() {
 	}
 	defer writesReader.Close()
 
-	messages = make(map[[16]byte]*rawMessage)
+	messages = make(map[[20]byte]*rawMessage)
 	toIngest = make(chan *rawRecord)
 	toParse = make(chan *rawMessage)
 	toProcess = make(chan *parsedMessage)
@@ -226,14 +231,14 @@ func main() {
 			for entries.Next(&key, &value) {
 				now := getNanoKtime()
 				delta := time.Duration(now - value.CreatedAt)
-				ptgid := uint64(key)
-				// id := uint64(pid) | (uint64(value.Fd) << 32)
-				var id [16]byte
-				binary.LittleEndian.PutUint64(id[:8], ptgid)
-				binary.LittleEndian.PutUint64(id[8:16], value.Sslp)
-				pid := binary.LittleEndian.Uint32(id[:4])
+				pid := uint64(key)
+				var id [20]byte
+				binary.LittleEndian.PutUint64(id[:8], pid)
+				binary.LittleEndian.PutUint64(id[8:16], value.SslConn)
+				binary.LittleEndian.PutUint32(id[16:20], value.SslCount)
+				tgid := binary.LittleEndian.Uint32(id[:4])
 				if LOG_LEVEL >= TRACE {
-					log.Printf("[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x], and TS=%d (now=%d)\n", id, ptgid, pid, value.Sslp, value.CreatedAt, now)
+					log.Printf(MAIN_TRACE_CHECK, id, pid, tgid, value.SslConn, value.SslCount, value.CreatedAt, now)
 					log.Printf("[MAIN] Trace flags: [%08x]", value.Flags)
 				}
 				if _, exists := messages[id]; !exists && delta > 5*time.Second {
@@ -317,24 +322,13 @@ func ingest() {
 	for record := range toIngest {
 		raw := *record.raw
 		isReq := record.isReq
-		if len(raw) < 32 {
+		data := helpers.ParseDataHeaders(raw)
+		if data == nil {
 			return
 		}
 		now := time.Now()
-		rawLen := raw[:8]
-		rawPid := raw[8:16]
-		rawSslp := raw[16:24]
-		rawTs := raw[24:32]
-		pid := binary.LittleEndian.Uint32(rawPid[:4])
-		sslp := binary.LittleEndian.Uint64(rawSslp)
-		ts := binary.LittleEndian.Uint64(rawTs)
-		payloadLen := binary.LittleEndian.Uint64(rawLen)
-		payload := raw[32 : 32+payloadLen]
-		// id := uint64(pid) | (uint64(fd) << 32)
-		// rawId := make([]byte, 8)
-		// binary.LittleEndian.PutUint64(rawId, id)
-		var id [16]byte
-		copy(id[:], raw[8:24])
+		payload := data.GetPayload(raw)
+		id := data.GetId()
 
 		message, isPresent := messages[id]
 
@@ -346,16 +340,16 @@ func ingest() {
 			if !isPresent {
 				log.Println(SEP)
 			}
-			log.Printf("[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%016x] (TGID: %d [%08x], SSL: [%016x]) - TS: %d\n", t, len(payload), id, pid, rawPid, rawSslp, ts)
+			log.Printf(INGEST_NEW_MESSAGE, t, data.PayloadLen, id, data.Tgid, data.Raw.Tgid, data.Raw.Sslp, data.Raw.Sslc, data.Ktime)
 			if LOG_LEVEL >= TRALL {
-				log.Printf("[INGEST] %s - RAW RECORD: % x\n", t, payload)
+				log.Printf(INGEST_NEW_MESSAGE_RAW, t, payload)
 			}
 		}
 
 		if !isPresent {
 			message = new(rawMessage)
 			message.createdAt = now
-			message.sslp = sslp
+			message.sslp = data.Sslp
 			message.id = id
 
 			if isReq {
@@ -380,7 +374,7 @@ func ingest() {
 			}
 		}
 
-		if payloadLen == 8 && binary.LittleEndian.Uint64(payload) == POISON {
+		if data.PayloadLen == 8 && binary.LittleEndian.Uint64(payload) == POISON {
 			if isReq {
 				message.isReqClosed = true
 			} else {

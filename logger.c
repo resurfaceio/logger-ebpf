@@ -37,7 +37,7 @@
 #define RINGBUF_SIZE        16777216 // max 16 MiB per ringbuf (32 MiB in total for both req and resp)
 
 #define POISON              0x8D0003048D0304F0
-#define INVALID_FD          MAX_U32_VALUE
+#define COUNTER_LOCK        MAX_U32_VALUE
 #define LOG_LEVEL           LOG_TRACE
 
 /**
@@ -48,18 +48,18 @@
 
 /**
  * Trace identifier
- * Description: holds the value of the socket file descriptor used to establish
- *              the underlying network connection for each HTTP request/response,
- *              by attempting to trace it throughout the socket lifecycle; i.e.
- *              from connect/accept/read/write/close syscalls. In addition, this
- *              struct keeps track of its initialization time as a u64 timestamp,
- *              as well as references to two buffers: reads, and writes.
+ * Description: holds the value of the *SSL used to establish the TLS connection for 
+ *              the TCP connection carrying each HTTP request/response, by attempting
+ *              to trace it throughout its lifecycle; i.e. from SSL_new, SSL_connect/accept, 
+ *              SSL_read/write, SSL_shutdown, and SSL_free calls. In addition, this struct 
+ *              keeps track of its initialization time as a u64 timestamp, as well as 
+ *              references to two buffers: reads, and writes.
  * 
- * [  sslp (64) | fd (32) [DEPRECATED] | flags (32) | created_at (64) | rbuf (64) | wbuf (64) ]
+ * [  ssl_conn (64) | ssl_count (32) | flags (32) | created_at (64) | rbuf (64) | wbuf (64) ]
  */
 struct trace_t {
-    u64 sslp;
-    u32 fd;
+    u64 ssl_conn;
+    u32 ssl_count;
     u32 flags;  // 0x0000 00ba where a: connected, b: closed
     u64 created_at;
     uintptr_t rbuf;
@@ -69,30 +69,30 @@ struct trace_t {
 /**
  * Data package
  * Descrption: package with char data to be sent to application in userspace through eBPF maps.
- * [ length (64) | pid_tgid (64) | sslp (64) | ts (64) | data (MAX_BYTES)]
+ * [ ts (64) | pid_tgid (64) | ssl_ptr (64) | ssl_count (32) | data length (32) | data (MAX_BYTES)]
  */
 struct data_t {
-    u64 len;
+    u64 ts;
     u64 pid;
     u64 sslp;
-    u64 ts;
+    u32 sslc;
+    u32 len;
     char data[MAX_BYTES];
 };
 
 /**
  * Pill package
  * Descrption: package with a single u64 member to be sent to application in userspace through eBPF maps.
- * [ data_len (64) | pid_tgid (64) | sslp (64) | ts (64) | pill (64) ]
+ * [ ts (64) | pid_tgid (64) | ssl_ptr (64) | ssl_count (32) | pill length (32) | pill (64)]
  */
 struct pill_t {
-    u64 len;
+    u64 ts;
     u64 pid;
     u64 sslp;
-    u64 ts;
+    u32 sslc;
+    u32 len;
     u64 pill;
 };
-
-const struct trace_t *unused __attribute__((unused));  // auto generates a given Go type with bpfgo
 
 
 /**
@@ -117,6 +117,13 @@ struct {
     __type(value, struct trace_t);
     __uint(max_entries, 100);
 } traces SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, __u64);
+    __uint(max_entries, 1000);
+} counts SEC(".maps");
 
 /**
  *
@@ -220,11 +227,60 @@ static long cat2long(int lower, int upper) {
  * 
  */
 
+ /**
+ * @name up_count
+ * @brief Increases the count for a given SSL connection, if counter is unlocked. Does nothing if counter is locked.
+ * 
+ * @param ssl *SSL Connection to trace.
+ * @return Current count if positive, or propagated return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
+ */
+static int up_count(u64 ssl) {
+    u64* count = bpf_map_lookup_elem(&counts, &ssl);
+    if (count == NULL) {
+        u64 new_count = cat2long((u32) ZERO, COUNTER_LOCK);
+        return (int) bpf_map_update_elem(&counts, &ssl, &new_count, BPF_NOEXIST);
+    }
+
+    u32 c = (u32) *count;
+    u32 lock = *count >> 32;
+    if (lock != COUNTER_LOCK) {
+        u64 new_count = cat2long(++c, COUNTER_LOCK);
+        int errno = (int) bpf_map_update_elem(&counts, &ssl, &new_count, BPF_EXIST);
+        if (errno < 0) return errno;
+    }
+    
+    return c;
+}
+
+ /**
+ * @name unlock_counter
+ * @brief Unlocks the counter for a given *SSL.
+ * 
+ * @param ssl *SSL Connection with counter to be unlocked.
+ * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
+ * @retval 1 if count does not exist in map.
+ */
+static int unlock_counter(u64 ssl) {
+    u64* count = bpf_map_lookup_elem(&counts, &ssl);
+    if (count == NULL) {
+        return 1;
+    }
+
+    u32 c = (u32) *count;
+    u32 lock = *count >> 32;
+    if (lock == COUNTER_LOCK) {
+        u64 new_count = cat2long(c, (int) ZERO);
+        return (int) bpf_map_update_elem(&counts, &ssl, &new_count, BPF_EXIST);
+    }
+
+    return 0;
+}
+
 /**
  * @name init_trace
- * @brief Initializes a trace with the current given pid+tgid, and a given file descriptor.
+ * @brief Initializes a trace with the current given pid+tgid, and a given SSL memory address value.
  * 
- * @param *SSL Connection to trace.
+ * @param ssl *SSL Connection to trace.
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  */
 static long init_trace(u64 ssl) {
@@ -233,18 +289,16 @@ static long init_trace(u64 ssl) {
     u64 ktime = bpf_ktime_get_ns();
     struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
     if (trace != NULL) {
-        trace->fd    = (u32) INVALID_FD;
-        trace->flags = (u32) ZERO;
-        trace->rbuf  = (uintptr_t) ZERO;
-        trace->wbuf  = (uintptr_t) ZERO;
+        trace->flags     = (u32) ZERO;
+        trace->rbuf      = (uintptr_t) ZERO;
+        trace->wbuf      = (uintptr_t) ZERO;
 
         exists = BPF_EXIST;
     } else {
         struct trace_t new_trace = {
-            .fd    = (u32) INVALID_FD,
-            .flags = (u32) ZERO,
-            .rbuf  = (uintptr_t) ZERO,
-            .wbuf  = (uintptr_t) ZERO,
+            .flags     = (u32) ZERO,
+            .rbuf      = (uintptr_t) ZERO,
+            .wbuf      = (uintptr_t) ZERO,
         };
         trace = &new_trace;
 
@@ -252,7 +306,8 @@ static long init_trace(u64 ssl) {
     }
 
     trace->created_at = ktime;
-    trace->sslp  = ssl;
+    trace->ssl_conn = ssl;
+    trace->ssl_count = up_count(ssl);
 
     return bpf_map_update_elem(&traces, &id, trace, exists);
 }
@@ -316,42 +371,6 @@ static int is_connected(struct trace_t* trace) {
     if (ssl_connected == 2) return 2;
 
     return connected || ssl_connected ;
-}
-
-/**
- * @name update_trace_fd
- * @brief Updates the trace identifier with a given socket file descriptor.
- * 
- * @param fd Socket file descriptor to trace.
- * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
- * @retval 0 if the traced file descriptor was updated successfully.
- * @retval 1 if the given fd value is equal to the current traced file descriptor value, and thus, not updated.
- * @retval 2 if the trace reference is NULL.
- * @retval 3 if the trace is closed for reads/writes.
- * @retval 4 if the trace is not connected.
- */
-static long update_trace_fd(int fd) {
-    u64 id = bpf_get_current_pid_tgid();
-
-    struct trace_t* trace = bpf_map_lookup_elem(&traces, &id);
-    if (trace == NULL) {
-        return 2;
-    }
-
-    if (is_closed(trace)) {
-        return 3;
-    }
-
-    if (!is_connected(trace)) {
-        return 4;
-    }
-    if (trace->fd == (u32) fd) {
-        return 1;
-    }
-
-    trace->fd = (u32) fd;
-
-    return bpf_map_update_elem(&traces, &id, trace, BPF_EXIST);
 }
 
 /**
@@ -447,7 +466,7 @@ static int SSL_entry(void* ssl, void *buf, int rw) {
         return 2;
     }
 
-    if (trace->sslp != (u64) ssl) {
+    if (trace->ssl_conn != (u64) ssl) {
         printk(LOG_TRACE, "SSL_entry", "wrong SSL pointer!");
         return 1;
     }
@@ -516,7 +535,8 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
         return 2;
     }
 
-    u64 sslp = trace->sslp;
+    u64 sslp = trace->ssl_conn;
+    u32 sslc = trace->ssl_count;
 
     if (rw == READ_OP) {
         buf = (char *) (trace->rbuf);
@@ -549,7 +569,7 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
         allotted->pid = id;
         allotted->sslp = sslp;
         allotted->ts = ktime;
-        allotted->len = sizeof(struct data_t) + (u64) (data_size - MAX_BYTES);
+        allotted->len = (u32) sizeof(struct data_t) + (u32) (data_size - MAX_BYTES);
         errno = bpf_probe_read_user(allotted->data, data_size, buf);
         if (errno < 0) {
             bpf_ringbuf_discard(allotted, 0);
@@ -573,9 +593,10 @@ static int poison_well() {
     }
     
     struct pill_t package = {
-        .len = sizeof(u64),
+        .len = (u32) sizeof(u64),
         .pid  = id,
-        .sslp = trace->sslp,
+        .sslp = trace->ssl_conn,
+        .sslc = trace->ssl_count,
         .ts   = ktime,
         .pill = (u64) POISON,
     };
@@ -707,6 +728,9 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
     }
     if (delete_trace() == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_shutdown", "trace deleted successfully.");
+    }
+    if (unlock_counter((u64) ssl) == 0) {
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", "counter unlocked successfully.");
     }
 
     return 0;
