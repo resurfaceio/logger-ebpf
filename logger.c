@@ -766,10 +766,13 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
     }
 
     long re = SSL_exit(ctx, READ_OP);
-    const static char m1[] = "[DEBUG] [uretprobe/SSL_read    ]: SSL_exit rc: %d, errno: %d";
-    bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
 
-    return (int) re;
+    if (LOG_LEVEL >= LOG_DEBUG) {
+        const static char m1[] = "[DEBUG] [uretprobe/SSL_read    ]: SSL_exit rc: %d, errno: %d";
+        bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
+    }
+
+    return 0;
 }
 
 SEC("uretprobe/SSL_write")
@@ -784,10 +787,13 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
     }
 
     long re = SSL_exit(ctx, WRITE_OP);
-    const static char m1[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit rc: %d, errno: %d";
-    bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
 
-    return (int) re;
+    if (LOG_LEVEL >= LOG_DEBUG) {
+        const static char m1[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit rc: %d, errno: %d";
+        bpf_trace_printk(m1, sizeof(m1), (int) re, re >> 32);
+    }
+
+    return 0;
 }
 
 char __license[] SEC("license") = "GPL v2";

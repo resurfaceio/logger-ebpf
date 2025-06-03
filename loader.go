@@ -30,11 +30,9 @@ func load(exPath string, isClient bool) []closer {
 	var err error
 	var objs loggerObjects
 	if err = loadLoggerObjects(&objs, nil); err != nil {
-		if DEBUG > 1 {
-			var verr *ebpf.VerifierError
-			if errors.As(err, &verr) {
-				log.Printf("%+v\n", verr)
-			}
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			log.Printf("%+v\n", verr)
 		}
 		log.Println("error: Loading eBPF objects:", err)
 		return nil

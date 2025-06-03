@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"ebpf-logger/helpers"
+	wl "ebpf-logger/helpers/wlog"
 
 	"github.com/cilium/ebpf/ringbuf"
 	logger "github.com/resurfaceio/logger-go/v3"
@@ -25,22 +25,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	NOLOG int = iota
-	ERROR
-	WARN
-	INFO
-	DEBUG
-	TRACE
-	TRALL
-)
-
 const POISON uint64 = 0x8D0003048D0304F0
-
 const SEP string = "🗣️ 📢 🔥🔥🔥"
-const INGEST_NEW_MESSAGE = "[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - KUPTIME: %d\n"
-const INGEST_NEW_MESSAGE_RAW = "[INGEST] %s - RAW RECORD: % x\n"
-const MAIN_TRACE_CHECK = "[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n"
 
 type parsedMessage struct {
 	httpReq        http.Request
@@ -69,10 +55,10 @@ type rawRecord struct {
 	isReq bool
 }
 
-var LOG_LEVEL int = ERROR
 var crlf []byte = []byte("\r\n")
 var httpbar []byte = []byte("HTTP/")
 
+var wlog *wl.Wlogger
 var messages map[[20]byte]*rawMessage
 var toIngest chan *rawRecord
 var toParse chan *rawMessage
@@ -90,26 +76,18 @@ func getNanoKtime() uint64 {
 }
 
 func main() {
-	defer log.Println("Thanks for using Graylog! 👋")
+	defer wl.Println("Thanks for using Graylog! 👋")
 
-	if level, err := strconv.Atoi(os.Getenv("USAGE_LOGGERS_EBPF_LOG_LEVEL")); err == nil {
-		if level < NOLOG {
-			LOG_LEVEL = NOLOG
-		} else {
-			LOG_LEVEL = min(level, TRACE)
-		}
-	}
+	wlog = wl.NewWrappedLogger(os.Getenv("USAGE_LOGGERS_EBPF_LOG_LEVEL"), wl.ERROR)
 
 	isClient := os.Getenv("USAGE_LOGGERS_EBPF_ROLE") == "client"
 
 	exPath, exists := os.LookupEnv("USAGE_LOGGERS_EBPF_EXPATH")
 	if !exists {
-		log.Fatalln("USAGE_LOGGERS_EBPF_EXPATH not set")
+		wl.Fatalln("USAGE_LOGGERS_EBPF_EXPATH not set")
 	}
 
-	if LOG_LEVEL >= DEBUG {
-		log.Println("Executable: ", exPath)
-	}
+	wlog.Println(wl.DEBUG, "Executable: ", exPath)
 
 	// Load programs
 	//---------------------------------------------------------
@@ -123,7 +101,7 @@ func main() {
 
 	objs, ok := closers[0].(*loggerObjects)
 	if !ok {
-		log.Panic("error trying to access maps: first item is not *loggerObjects")
+		wl.Panic("error trying to access maps: first item is not *loggerObjects")
 	}
 
 	// Define structures to receive data
@@ -131,13 +109,13 @@ func main() {
 
 	readsReader, err := ringbuf.NewReader(objs.Reads)
 	if err != nil {
-		log.Panicf("opening ringbuf reader: %s", err)
+		wl.Panicf("opening ringbuf reader: %s", err)
 	}
 	defer readsReader.Close()
 
 	writesReader, err := ringbuf.NewReader(objs.Writes)
 	if err != nil {
-		log.Panicf("opening ringbuf reader: %s", err)
+		wl.Panicf("opening ringbuf reader: %s", err)
 	}
 	defer writesReader.Close()
 
@@ -157,32 +135,24 @@ func main() {
 	opts := logger.Options{Rules: os.Getenv("USAGE_LOGGERS_RULES")}
 	l, err = logger.NewHttpLogger(opts)
 	if err != nil {
-		if LOG_LEVEL >= ERROR {
-			log.Println("initializing logger: ", err)
-		}
+		wlog.Println(wl.ERROR, "initializing logger: ", err)
 		return
 	}
 	if !l.Enabled() {
-		if LOG_LEVEL >= ERROR {
-			log.Println("logger is not enabled")
-		}
+		wlog.Println(wl.ERROR, "logger is not enabled")
 		return
 	}
 
-	if !l.IsFlukeReachable() && LOG_LEVEL >= WARN {
-		log.Println("warning: could not reach fluke during logger initialization")
-	} else if LOG_LEVEL >= INFO {
-		log.Println("Graylog fluke server is reachable.")
+	if !l.IsFlukeReachable() {
+		wlog.Println(wl.WARN, "warning: could not reach fluke during logger initialization")
+	} else {
+		wlog.Println(wl.INFO, "Graylog fluke server is reachable.")
 	}
 
-	if LOG_LEVEL >= INFO {
-		log.Println("HTTPS logger is initialized.")
-		if LOG_LEVEL >= DEBUG {
-			log.Println("  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
-			log.Println("  rules: ", opts.Rules)
-		}
-		log.Println("Waiting for any HTTPS payloads from OpenSSL calls...")
-	}
+	wlog.Println(wl.INFO, "HTTPS logger is initialized.")
+	wlog.Println(wl.DEBUG, "  url:   ", os.Getenv("USAGE_LOGGERS_URL"))
+	wlog.Println(wl.DEBUG, "  rules: ", opts.Rules)
+	wlog.Println(wl.INFO, "Waiting for any HTTPS payloads from OpenSSL calls...")
 
 	go process()
 	go parse()
@@ -196,31 +166,23 @@ func main() {
 	for {
 		select {
 		case <-stop:
-			log.Println("Received signal, exiting...")
+			wl.Println("Received signal, exiting...")
 
 			if err := readsReader.Flush(); err != nil {
-				if LOG_LEVEL >= ERROR {
-					log.Printf("flushing ringbuf reads reader: %s", err)
-				}
+				wlog.Printf(wl.ERROR, "flushing ringbuf reads reader: %s", err)
 				return
 			}
 			if err := readsReader.Close(); err != nil {
-				if LOG_LEVEL >= ERROR {
-					log.Printf("closing ringbuf reads reader: %s", err)
-				}
+				wlog.Printf(wl.ERROR, "closing ringbuf reads reader: %s", err)
 				return
 			}
 
 			if err := writesReader.Flush(); err != nil {
-				if LOG_LEVEL >= ERROR {
-					log.Printf("flushing ringbuf writes reader: %s", err)
-				}
+				wlog.Printf(wl.ERROR, "flushing ringbuf writes reader: %s", err)
 				return
 			}
 			if err := writesReader.Close(); err != nil {
-				if LOG_LEVEL >= ERROR {
-					log.Printf("closing ringbuf writes reader: %s", err)
-				}
+				wlog.Printf(wl.ERROR, "closing ringbuf writes reader: %s", err)
 				return
 			}
 			return
@@ -237,22 +199,24 @@ func main() {
 				binary.LittleEndian.PutUint64(id[8:16], value.SslConn)
 				binary.LittleEndian.PutUint32(id[16:20], value.SslCount)
 				tgid := binary.LittleEndian.Uint32(id[:4])
-				if LOG_LEVEL >= TRACE {
-					log.Printf(MAIN_TRACE_CHECK, id, pid, tgid, value.SslConn, value.SslCount, value.CreatedAt, now)
-					log.Printf("[MAIN] Trace flags: [%08x]", value.Flags)
-				}
+				wlog.Printf(wl.TRACE, "[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n",
+					id,
+					pid,
+					tgid,
+					value.SslConn,
+					value.SslCount,
+					value.CreatedAt,
+					now,
+				)
+				wlog.Printf(wl.TRACE, "[MAIN] Trace flags: [%08x]", value.Flags)
 				if _, exists := messages[id]; !exists && delta > 5*time.Second {
 					objs.Traces.Delete(&key)
-					if LOG_LEVEL >= TRACE {
-						log.Printf("[MAIN] Trace [%016x] timed out! Trace was deleted from BPF map.", id)
-					}
+					wlog.Printf(wl.TRACE, "[MAIN] Trace [%016x] timed out! Trace was deleted from BPF map.", id)
 				}
 			}
 
 			if err := entries.Err(); err != nil {
-				if LOG_LEVEL >= ERROR {
-					log.Println("[MAIN] Traces map iterator encountered an error:", err)
-				}
+				wlog.Println(wl.ERROR, "[MAIN] Traces map iterator encountered an error:", err)
 				return
 			}
 
@@ -269,9 +233,7 @@ func readRing(reader *ringbuf.Reader, fromReads bool, isClient bool) {
 	for {
 		if received, err := reader.Read(); err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				if LOG_LEVEL >= INFO {
-					log.Println("closing ingestion channel...")
-				}
+				wlog.Println(wl.INFO, "closing ingestion channel...")
 				select {
 				case _, ok := <-toIngest:
 					if ok {
@@ -282,9 +244,7 @@ func readRing(reader *ringbuf.Reader, fromReads bool, isClient bool) {
 				}
 				return
 			}
-			if LOG_LEVEL >= INFO {
-				log.Printf("reading from %s reader: %s", name, err)
-			}
+			wlog.Printf(wl.INFO, "reading from %s reader: %s", name, err)
 			continue
 		} else {
 			toIngest <- &rawRecord{
@@ -304,13 +264,9 @@ func parse() {
 				parsed, done = parseFirstFound(message)
 				if parsed != nil {
 					message.isParsed = true
-					if LOG_LEVEL >= DEBUG {
-						log.Printf("[PARSE] Message [%16x] successfully parsed.", message.id)
-						if LOG_LEVEL >= TRALL {
-							log.Printf("[PARSE] Raw Request: [% x]\n", message.rawReq)
-							log.Printf("[PARSE] Raw Response: [% x]\n", message.rawResp)
-						}
-					}
+					wlog.Printf(wl.DEBUG, "[PARSE] Message [%16x] successfully parsed.", message.id)
+					wlog.Printf(wl.TRALL, "[PARSE] Raw %s: [% x]\n", "Request", message.rawReq)
+					wlog.Printf(wl.TRALL, "[PARSE] Raw %s: [% x]\n", "Response", message.rawResp)
 					toProcess <- parsed
 				}
 			}
@@ -332,18 +288,24 @@ func ingest() {
 
 		message, isPresent := messages[id]
 
-		if LOG_LEVEL >= DEBUG {
-			t := "RESP"
+		if label := "RESP"; wlog.GetLevel() >= wl.DEBUG {
 			if isReq {
-				t = "REQ "
+				label = "REQ "
 			}
 			if !isPresent {
-				log.Println(SEP)
+				wl.Println(SEP)
 			}
-			log.Printf(INGEST_NEW_MESSAGE, t, data.PayloadLen, id, data.Tgid, data.Raw.Tgid, data.Raw.Sslp, data.Raw.Sslc, data.Ktime)
-			if LOG_LEVEL >= TRALL {
-				log.Printf(INGEST_NEW_MESSAGE_RAW, t, payload)
-			}
+			wl.Printf("[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - KUPTIME: %d\n",
+				label,
+				data.PayloadLen,
+				id,
+				data.Tgid,
+				data.Raw.Tgid,
+				data.Raw.Sslp,
+				data.Raw.Sslc,
+				data.Ktime,
+			)
+			wlog.Printf(wl.TRALL, "[INGEST] %s - RAW RECORD: % x\n", label, payload)
 		}
 
 		if !isPresent {
@@ -383,9 +345,7 @@ func ingest() {
 			if message.isReqClosed && message.isRespClosed {
 				toParse <- message
 				delete(messages, id)
-				if LOG_LEVEL >= TRACE {
-					log.Printf("[INGEST] Message [%016x] removed from messages map.", id)
-				}
+				wlog.Printf(wl.TRACE, "[INGEST] Message [%016x] removed from messages map.", id)
 			}
 		} else if isReq {
 			message.rawReq = append(message.rawReq, payload...)
@@ -417,9 +377,11 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 	parsed = new(parsedMessage)
 	parsed.isHttp2 = message.isHttp2
 
-	if LOG_LEVEL >= TRACE {
-		log.Printf("[PARSE] Raw Message info <len(req), len(resp), isHttp2>: %d, %d, %v\n", len(message.rawReq), len(message.rawResp), message.isHttp2)
-	}
+	wlog.Printf(wl.TRACE, "[PARSE] Raw Message info <len(req), len(resp), isHttp2>: %d, %d, %v\n",
+		len(message.rawReq),
+		len(message.rawResp),
+		message.isHttp2,
+	)
 
 	if !message.isHttp2 {
 		// [first-line, headers, body+trailers]
@@ -438,9 +400,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 		firstLine := bytes.Fields(req[0])
 
 		if len(firstLine) <= 1 {
-			if LOG_LEVEL >= ERROR {
-				log.Printf("[PARSE] ERROR: couldn't parse message as HTTP1. Attempting again as HTTP2")
-			}
+			wlog.Printf(wl.ERROR, "[PARSE] ERROR: couldn't parse message as HTTP1. Attempting again as HTTP2")
 			message.isHttp2 = true
 			return nil, false
 		}
@@ -455,9 +415,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 		}
 		parsedUrl, err := url.Parse(string(path))
 		if err != nil {
-			if LOG_LEVEL >= ERROR {
-				log.Println("parsing url: ", err)
-			}
+			wlog.Println(wl.ERROR, "parsing url: ", err)
 			return nil, consumed
 		}
 
@@ -471,9 +429,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 		// Status code
 		status, err := strconv.Atoi(string(firstLine[1]))
 		if err != nil {
-			if LOG_LEVEL >= ERROR {
-				log.Println("parsing status code: ", err)
-			}
+			wlog.Println(wl.ERROR, "parsing status code: ", err)
 			return nil, consumed
 		}
 
@@ -517,13 +473,9 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 
 		// Bodies
 
-		if LOG_LEVEL >= TRACE {
-			log.Printf("[PARSE] Body lengths (req, resp): (%d, %d)\n", len(req[2]), len(resp[2]))
-			if LOG_LEVEL >= TRALL {
-				log.Printf("[PARSE] Request body: % x\n", req[2])
-				log.Printf("[PARSE] Response body: % x\n", resp[2])
-			}
-		}
+		wlog.Printf(wl.TRACE, "[PARSE] Parsed body lengths <req, resp>: %d, %d\n", len(req[2]), len(resp[2]))
+		wlog.Printf(wl.TRALL, "[PARSE] %s body: % x\n", "REQUEST", req[2])
+		wlog.Printf(wl.TRALL, "[PARSE] %s body: % x\n", "RESPONSE", resp[2])
 
 		// Wrap it up
 		parsed.httpReq = http.Request{
@@ -556,36 +508,32 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 		respHeaders := http.Header{}
 
 		for i, raw := range [][]byte{message.rawReq, message.rawResp} {
-			label := "REQ"
+			label := "REQ "
 			if i != 0 {
 				label = "RESP"
 			}
 			for _, frame := range toFrames(raw) {
-				if LOG_LEVEL >= TRALL {
-					log.Printf("[PARSE] %s - RAW FRAME: % x", label, frame._raw)
-					log.Printf("[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
-						label,
-						frame._lend,
-						frame._len,
-						frame._type,
-						frame._flag,
-						frame._streamIDd,
-						frame._streamID,
-						frame._data,
-					)
-				}
+				wlog.Printf(wl.TRALL, "[PARSE] %s - RAW FRAME: % x", label, frame._raw)
+				wlog.Printf(wl.TRALL, "[PARSE] %s - PARSED FRAME\n\tLength: %d [% x]\n\tType: % x\n\tFlag: % x\n\tStream ID: %d [% x]\n\tRaw Data: % x\n",
+					label,
+					frame._lend,
+					frame._len,
+					frame._type,
+					frame._flag,
+					frame._streamIDd,
+					frame._streamID,
+					frame._data,
+				)
 
 				if frame._type == HEADERS {
 					decoder := hpack.NewDecoder(4096, nil)
 					headers, err := decoder.DecodeFull(frame._data)
 					if err != nil {
-						log.Println("decoding headers: ", err)
+						wl.Println("decoding headers: ", err)
 						continue
 					}
 
-					if LOG_LEVEL >= DEBUG {
-						log.Printf("[PARSE] %s - HEADERS\n", label)
-					}
+					wlog.Printf(wl.DEBUG, "[PARSE] %s - HEADERS\n", label)
 
 					for _, header := range headers {
 						switch header.Name {
@@ -599,9 +547,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 						case ":path":
 							pathQuery, err := url.ParseRequestURI(header.Value)
 							if err != nil {
-								if LOG_LEVEL >= ERROR {
-									log.Println("decoding path: ", err)
-								}
+								wlog.Println(wl.ERROR, "decoding path: ", err)
 								return nil, false
 							}
 							parsedUrl.Path = pathQuery.Path
@@ -609,9 +555,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 						case ":status":
 							status, err = strconv.Atoi(header.Value)
 							if err != nil {
-								if LOG_LEVEL >= ERROR {
-									log.Println("parsing url: ", err)
-								}
+								wlog.Println(wl.ERROR, "parsing url: ", err)
 								return nil, false
 							}
 						default:
@@ -621,9 +565,7 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 								respHeaders.Add(header.Name, header.Value)
 							}
 						}
-						if LOG_LEVEL >= DEBUG {
-							log.Println(header.Name + ":" + header.Value)
-						}
+						wlog.Println(wl.DEBUG, header.Name+":"+header.Value)
 					}
 				}
 
@@ -634,17 +576,11 @@ func parseFirstFound(message *rawMessage) (parsed *parsedMessage, consumed bool)
 						respBody = append(respBody, frame._data...)
 					}
 
-					if LOG_LEVEL >= DEBUG {
-						log.Printf("[PARSE] %s - DATA LENGTH: %d\n", label, len(frame._data))
-						if LOG_LEVEL >= TRALL {
-							log.Printf("[PARSE] %s - DATA: %s\n", label, frame._data)
-						}
-					}
+					wlog.Printf(wl.DEBUG, "[PARSE] %s - DATA LENGTH: %d\n", label, len(frame._data))
+					wlog.Printf(wl.TRALL, "[PARSE] %s - DATA: %s\n", label, frame._data)
 				}
 
-				if LOG_LEVEL >= TRALL {
-					log.Println(SEP)
-				}
+				wlog.Println(wl.TRALL, SEP)
 			}
 
 			// Wrap it up
@@ -682,25 +618,25 @@ func process() {
 	for {
 		message := <-toProcess
 		if message != nil {
-			if LOG_LEVEL >= DEBUG {
-				log.Println(SEP)
-				log.Println("[PROCESS] Request: ", message.httpReq)
-				log.Println("[PROCESS] Response: ", message.httpResp)
-				log.Println("[PROCESS] Response time: ", message.responseMillis)
-				log.Println("[PROCESS] Interval: ", message.interval)
-				log.Printf("[PROCESS] Message is HTTP2: %v\n", message.isHttp2)
+			if wlog.GetLevel() >= wl.DEBUG {
+				wl.Println(SEP)
+				wl.Println("[PROCESS] Request: ", message.httpReq)
+				wl.Println("[PROCESS] Response: ", message.httpResp)
+				wl.Println("[PROCESS] Response time: ", message.responseMillis)
+				wl.Println("[PROCESS] Interval: ", message.interval)
+				wl.Printf("[PROCESS] Message is HTTP2: %v\n", message.isHttp2)
 
-				if LOG_LEVEL >= TRALL {
+				if wlog.GetLevel() >= wl.TRALL {
 					body, err := io.ReadAll(message.httpReq.Body)
 					if err == nil {
-						log.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
+						wl.Printf("[PROCESS] Request body %v:\n%s\n", message.httpReq.Body, body)
 						message.httpReq.Body.Close()
 						message.httpReq.Body = io.NopCloser(bytes.NewReader(body))
 					}
 
 					body, err = io.ReadAll(message.httpResp.Body)
 					if err == nil {
-						log.Printf("[PROCESS] Response body %v:\n%s\n", message.httpResp.Body, body)
+						wl.Printf("[PROCESS] Response body %v:\n%s\n", message.httpResp.Body, body)
 						message.httpResp.Body.Close()
 						message.httpResp.Body = io.NopCloser(bytes.NewReader(body))
 					}
@@ -709,9 +645,7 @@ func process() {
 			if l.IsFlukeReachable() {
 				logger.SendHttpMessage(l, &message.httpResp, &message.httpReq, message.responseMillis, message.interval, nil)
 			} else {
-				if LOG_LEVEL >= ERROR {
-					log.Println("[PROCESS] Could not send message. Fluke server is not reachable at the moment")
-				}
+				wlog.Println(wl.ERROR, "[PROCESS] Could not send message. Fluke server is not reachable at the moment")
 				continue
 			}
 		}
