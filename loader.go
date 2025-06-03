@@ -121,7 +121,7 @@ func load(exPath string, isClient bool) []closer {
 		}
 		closers = append(closers, entrySetAcceptState)
 
-		exitHandshake, err := ex.Uretprobe("SSL_do_handshake", objs.RetSslAccept, nil)
+		exitHandshake, err := ex.Uretprobe("SSL_do_handshake", objs.RetSslDoHandshake, nil)
 		if err != nil {
 			log.Panicln("error: Attaching SSL_accept uretprobe:", err)
 		}

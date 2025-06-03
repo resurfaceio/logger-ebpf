@@ -677,7 +677,7 @@ SEC("uprobe/SSL_accept")
 int BPF_UPROBE(entry_ssl_accept, void* ssl) {
     if (LOG_LEVEL >= LOG_TRACE) {
         const u64 id = bpf_get_current_pid_tgid();
-        const static char m[] = "[TRACE] [uprobe/SSL_accept     ] : waiting for TLS/SSL handshake for PID %d.";
+        const static char m[] = "[TRACE] [uprobe/SSL_accept     ]: waiting for TLS/SSL handshake for PID %d.";
         bpf_trace_printk(m, sizeof(m), id);
     }
 
@@ -710,6 +710,23 @@ int BPF_URETPROBE(ret_ssl_accept) {
         if (delete_trace() == 0) {
             printk(LOG_DEBUG, "uretprobe/SSL_accept", "trace deleted successfully.");
         }
+    }
+
+    return 0;
+}
+
+SEC("uretprobe/SSL_do_handshake")
+int BPF_URETPROBE(ret_ssl_do_handshake) {
+    int rc = PT_REGS_RC(ctx);
+    if (rc == 1) {
+        if (LOG_LEVEL >= LOG_DEBUG) {
+            const u64 id = bpf_get_current_pid_tgid();
+            const static char m[] = "[DEBUG] [uretprobe/SSL_accept  ]: TLS/SSL handshake successfully completed for PID %d.";
+            bpf_trace_printk(m, sizeof(m), id);
+        }
+
+        update_trace_flags(TRACE_FLAGS_OP_OR, TRACE_SSL_CONNECTED);
+
     }
 
     return 0;
