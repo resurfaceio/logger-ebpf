@@ -113,6 +113,19 @@ func load(exPath string, isClient bool) []closer {
 			log.Panicln("error: Attaching SSL_accept uretprobe:", err)
 		}
 		closers = append(closers, exitAccept)
+
+		// SSL_set_accept_state + SSL_do_handshake
+		entrySetAcceptState, err := ex.Uprobe("SSL_set_accept_state", objs.EntrySslAccept, nil)
+		if err != nil {
+			log.Panicln("error: Attaching SSL_set_accept_state uprobe:", err)
+		}
+		closers = append(closers, entrySetAcceptState)
+
+		exitHandshake, err := ex.Uretprobe("SSL_do_handshake", objs.RetSslAccept, nil)
+		if err != nil {
+			log.Panicln("error: Attaching SSL_accept uretprobe:", err)
+		}
+		closers = append(closers, exitHandshake)
 	}
 
 	// SSL_shutdown
