@@ -569,7 +569,7 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
         allotted->pid = id;
         allotted->sslp = sslp;
         allotted->ts = ktime;
-        allotted->len = (u32) sizeof(struct data_t) + (u32) (data_size - MAX_BYTES);
+        allotted->len = data_size;
         errno = bpf_probe_read_user(allotted->data, data_size, buf);
         if (errno < 0) {
             bpf_ringbuf_discard(allotted, 0);
