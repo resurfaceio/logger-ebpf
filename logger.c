@@ -28,7 +28,7 @@
 
 #define POISON              0x8D0003048D0304F0
 #define COUNTER_LOCK        MAX_U32_VALUE
-#define LOG_LEVEL           LOG_TRACE
+#define LOG_LEVEL           LOG_DEBUG
 
 /**
  * 
@@ -388,7 +388,7 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
     }
 
     if (stash->ssl != (u64) ssl_p) {
-        printk(LOG_INFO, "SSL_entry", "stash->ssl != ssl provided");
+        printk(LOG_ERROR, "SSL_entry", "stash->ssl != ssl provided");
         // return 2;
     }
 
@@ -620,7 +620,7 @@ SEC("uretprobe/SSL_new")
 int BPF_URETPROBE(ret_ssl_new) {
     void *ssl = (void *) PT_REGS_RC(ctx);
     if (ssl == NULL) {
-        printk(LOG_INFO, "uetprobe/SSL_new", "ssl is NULL");
+        printk(LOG_DEBUG, "uetprobe/SSL_new", "ssl is NULL");
         return 1;
     }
 
