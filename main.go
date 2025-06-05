@@ -159,8 +159,9 @@ func main() {
 	go ingest()
 
 	var (
-		key   uint64
-		value loggerTraceT
+		key     uint64
+		stash   loggerStashT
+		counter loggerCounterT
 	)
 
 	for {
@@ -188,35 +189,54 @@ func main() {
 			return
 
 		default:
-			entries := objs.Traces.Iterate()
+			entries := objs.Stashes.Iterate()
 
-			for entries.Next(&key, &value) {
+			for entries.Next(&key, &stash) {
 				now := getNanoKtime()
-				delta := time.Duration(now - value.CreatedAt)
-				pid := uint64(key)
-				var id [20]byte
-				binary.LittleEndian.PutUint64(id[:8], pid)
-				binary.LittleEndian.PutUint64(id[8:16], value.SslConn)
-				binary.LittleEndian.PutUint32(id[16:20], value.SslCount)
-				tgid := binary.LittleEndian.Uint32(id[:4])
-				wlog.Printf(wl.TRACE, "[MAIN] Checking trace with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n",
-					id,
-					pid,
-					tgid,
-					value.SslConn,
-					value.SslCount,
-					value.CreatedAt,
-					now,
-				)
-				wlog.Printf(wl.TRACE, "[MAIN] Trace flags: [%08x]", value.Flags)
-				if _, exists := messages[id]; !exists && delta > 5*time.Second {
-					objs.Traces.Delete(&key)
-					wlog.Printf(wl.TRACE, "[MAIN] Trace [%016x] timed out! Trace was deleted from BPF map.", id)
+				delta := time.Duration(now - stash.CreatedAt)
+				ssl := stash.Ssl
+				err = objs.Counts.Lookup(&ssl, &counter)
+				if err != nil {
+					var id [20]byte
+					binary.LittleEndian.PutUint64(id[:8], key)
+					binary.LittleEndian.PutUint64(id[8:16], ssl)
+					binary.LittleEndian.PutUint32(id[16:20], counter.Count)
+					tgid := binary.LittleEndian.Uint32(id[:4])
+					wlog.Printf(wl.TRACE, "[MAIN] Checking stash with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n",
+						id,
+						key,
+						tgid,
+						ssl,
+						counter.Count,
+						stash.CreatedAt,
+						now,
+					)
+
+					if _, exists := messages[id]; !exists && delta > 5*time.Second {
+						objs.Stashes.Delete(&key)
+						wlog.Printf(wl.TRACE, "[MAIN] Stash [%016x] timed out! Stash was deleted from BPF map.", id)
+					}
 				}
 			}
 
 			if err := entries.Err(); err != nil {
-				wlog.Println(wl.ERROR, "[MAIN] Traces map iterator encountered an error:", err)
+				wlog.Println(wl.ERROR, "[MAIN] Stashes map iterator encountered an error:", err)
+				return
+			}
+
+			entries = objs.Counts.Iterate()
+
+			for entries.Next(&key, &counter) {
+				delta := time.Duration(getNanoKtime() - counter.LastUpdated)
+				if delta > 3*time.Hour && counter.Lock == ^uint32(0) {
+					objs.Counts.Delete(&key)
+					wlog.Printf(wl.TRACE, "[MAIN] Counter [%016x] timed out! Count was deleted from BPF map.", key)
+				}
+
+			}
+
+			if err = entries.Err(); err != nil {
+				wlog.Println(wl.ERROR, "[MAIN] Counts map iterator encountered an error:", err)
 				return
 			}
 
@@ -295,7 +315,7 @@ func ingest() {
 			if !isPresent {
 				wl.Println(SEP)
 			}
-			wl.Printf("[INGEST] %s - NEW RECORD (%-5d B) - TRACE ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - KUPTIME: %d\n",
+			wl.Printf("[INGEST] %s - NEW RECORD (%-5d B) - STASH ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - TS: %d\n",
 				label,
 				data.PayloadLen,
 				id,

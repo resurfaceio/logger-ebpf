@@ -61,6 +61,13 @@ func load(exPath string, isClient bool) []closer {
 
 	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
 
+	// SSL_new
+	exitNew, err := ex.Uretprobe("SSL_new", objs.RetSslNew, nil)
+	if err != nil {
+		log.Panicln("error: Attaching SSL_new uretprobe:", err)
+	}
+	closers = append(closers, exitNew)
+
 	// SSL_read
 	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySslRead, nil)
 	if err != nil {
@@ -114,18 +121,12 @@ func load(exPath string, isClient bool) []closer {
 		}
 		closers = append(closers, exitAccept)
 
-		// SSL_set_accept_state + SSL_do_handshake
+		// SSL_set_accept_state
 		entrySetAcceptState, err := ex.Uprobe("SSL_set_accept_state", objs.EntrySslAccept, nil)
 		if err != nil {
 			log.Panicln("error: Attaching SSL_set_accept_state uprobe:", err)
 		}
 		closers = append(closers, entrySetAcceptState)
-
-		exitHandshake, err := ex.Uretprobe("SSL_do_handshake", objs.RetSslDoHandshake, nil)
-		if err != nil {
-			log.Panicln("error: Attaching SSL_accept uretprobe:", err)
-		}
-		closers = append(closers, exitHandshake)
 	}
 
 	// SSL_shutdown
@@ -134,6 +135,13 @@ func load(exPath string, isClient bool) []closer {
 		log.Panicln("error: Attaching SSL_shutdown uprobe:", err)
 	}
 	closers = append(closers, entryShutdown)
+
+	// SSL_free
+	entryFree, err := ex.Uprobe("SSL_free", objs.EntrySslFree, nil)
+	if err != nil {
+		log.Panicln("error: Attaching SSL_free uprobe:", err)
+	}
+	closers = append(closers, entryFree)
 
 	return closers
 }
