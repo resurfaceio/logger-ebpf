@@ -315,14 +315,14 @@ func ingest() {
 			if !isPresent {
 				wl.Println(SEP)
 			}
-			wl.Printf("[INGEST] %s - NEW RECORD (%-5d B) - STASH ID: [%020x] (TGID: %d [%08x], SSL: [%016x|%08x]) - TS: %d\n",
+			wl.Printf("[INGEST] %s - NEW RECORD (%-5d B) - SID: [%020x] (TGID: %d [%08x], SSL: [%016x|%d]) - TS: %d\n",
 				label,
 				data.PayloadLen,
 				id,
 				data.Tgid,
 				data.Raw.Tgid,
 				data.Raw.Sslp,
-				data.Raw.Sslc,
+				data.Sslc,
 				data.Ktime,
 			)
 			wlog.Printf(wl.TRALL, "[INGEST] %s - RAW RECORD: % x\n", label, payload)
