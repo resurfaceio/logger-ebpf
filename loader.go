@@ -61,13 +61,6 @@ func load(exPath string, isClient bool) []closer {
 
 	// Define links between OpenSSL functions and the corresponding BPF functions in logger.c
 
-	// SSL_new
-	exitNew, err := ex.Uretprobe("SSL_new", objs.RetSslNew, nil)
-	if err != nil {
-		log.Panicln("error: Attaching SSL_new uretprobe:", err)
-	}
-	closers = append(closers, exitNew)
-
 	// SSL_read
 	entryRead, err := ex.Uprobe("SSL_read", objs.EntrySslRead, nil)
 	if err != nil {

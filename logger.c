@@ -37,21 +37,19 @@
  */
 
 /**
- * Stash identifier
+ * Trace stash
  * Description: holds the value of the *SSL used to establish the TLS connection for 
  *              the underlying network connection carrying each HTTP request/response, 
  *              by stashing it throughout the TLS connection lifecycle; i.e. from 
  *              SSL_connect/accept calls, to SSL_read/write, and finally SSL_shutdown.
  *              In addition, this struct keeps track of its initialization time as a 
- *              u64 timestamp, as well as references to two buffers: reads, and writes.
+ *              u64 timestamp.
  * 
- * [  ssl (64) | created_at (64) | rbuf (64) | wbuf (64) ]
+ * [  ssl (64) | created_at (64) ]
  */
 struct stash_t {
     u64 ssl;
     u64 created_at;
-    uintptr_t rbuf;
-    uintptr_t wbuf;
 };
 
 /**
@@ -83,19 +81,22 @@ struct pill_t {
 };
 
 /**
- * SSL counter
+ * Buffer stash + SSL counter
  * Description: keeps track of the number of times a given *SSL memory address has been
  *              (re)used, by updating a counter each time it is allocated using SSL_new.
  *              A flag lock is put in place in order to prevent unwanted modifications to 
  *              the current count. Once SSL_free is called, the corresponding counter is 
  *              unlocked. In addition, this struct keeps track of the last time the lock
- *              state changed as a u64 timestamp.
- * [ count (32) | lock (32) | last_updated (64) ]
+ *              state was modified as a u64 timestamp, as well as references to two SSL 
+ *              buffers: reads, and writes.
+ * [ count (32) | lock (32) | last_updated (64) | rbuf (64) | wbuf (64) ]
  */
 struct counter_t {
     u32 count;
     u32 lock;
     u64 last_updated;
+    uintptr_t rbuf;
+    uintptr_t wbuf;
 };
 
 
@@ -225,6 +226,7 @@ static long cat2long(int lower, int upper) {
  * 
  * @param ssl_p *SSL connection to trace.
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @retval 1 if counter already exists in counts map.
  */
  static int init_count(void* ssl_p) {
     u64 ssl = (u64) ssl_p;
@@ -237,23 +239,10 @@ static long cat2long(int lower, int upper) {
         .count        = (u32) ZERO,
         .lock         = (u32) COUNTER_LOCK,
         .last_updated = ktime,
+        .rbuf         = (uintptr_t) ZERO,
+        .wbuf         = (uintptr_t) ZERO,
     };
     return (int) bpf_map_update_elem(&counts, &ssl, &new_counter, BPF_NOEXIST);
- }
-
- /**
-  * @name get_count
-  * @brief Gets the current count for a given *SSL.
-  * 
-  * @param ssl *SSL connection to trace as a u64.
-  * @return Current count, or 0 if counter doesn't exist.
-  */
-
- static u32 get_count(u64 ssl) {
-    struct counter_t *counter = bpf_map_lookup_elem(&counts, &ssl);
-    if (counter == NULL) return 0;
-
-    return counter->count;
  }
 
  /**
@@ -330,23 +319,18 @@ static long init_stash(void* ssl) {
     u64 id = bpf_get_current_pid_tgid();
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
     if (stash != NULL) {
-        stash->rbuf = (uintptr_t) ZERO;
-        stash->wbuf = (uintptr_t) ZERO;
-
         exists = BPF_EXIST;
     } else {
-        struct stash_t new_stash = {
-            .rbuf   = (uintptr_t) ZERO,
-            .wbuf   = (uintptr_t) ZERO,
-        };
+        struct stash_t new_stash = {};
         stash = &new_stash;
 
         exists = BPF_NOEXIST;
     }
 
+    if (init_count(ssl) == 1) up_count(ssl);
+
     stash->created_at = ktime;
-    stash->ssl = (u64) ssl;;
-    up_count(ssl);
+    stash->ssl = (u64) ssl;
 
     return bpf_map_update_elem(&stashes, &id, stash, exists);
 }
@@ -375,30 +359,41 @@ static long delete_stash() {
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  * @retval 0 if the reference was stashed successfully.
  * @retval 1 if the underlying TLS connection has not been established (stash is NULL).
- * @retval 2 if the underlying TLS connection does not match the provided ssl_p.
- * @retval 3 if the operation specified by rw is not supported.
+ * @retval 2 if the underlying TLS connection has not been recognized (count is NULL).
+ * @retval 3 if the attempt to reinitialize a counter for the given TLS connection has failed.
+ * @retval 4 if the operation specified by rw is not supported.
  */
 static int SSL_entry(void* ssl_p, void *buf, int rw) {
     u64 id = bpf_get_current_pid_tgid();
 
+    // bpf_trace_printk("[TEST] [SSL_entry] buf address: %p", 35, buf);
+
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
     if (stash == NULL) {
-        printk(LOG_TRACE, "SSL_entry", "stash is NULL");
         return 1;
     }
 
-    if (stash->ssl != (u64) ssl_p) {
-        printk(LOG_ERROR, "SSL_entry", "stash->ssl != ssl provided");
+    u64 ssl = (u64) ssl_p;
+    if (stash->ssl != ssl) {
+        printk(LOG_ERROR, "SSL_entry", "stash->ssl != ssl provided. Trying to reassign to existing counter...");
+        stash->ssl = ssl;
         // return 2;
     }
 
+    struct counter_t* counter = bpf_map_lookup_elem(&counts, &ssl);
+    if (counter == NULL) {
+        printk(LOG_ERROR, "SSL_entry", "counter is NULL. Trying to initialize new counter...");
+        if (init_count(ssl_p) < 0) return 2;
+        counter = bpf_map_lookup_elem(&counts, &ssl);
+        if (counter == NULL) return 3;
+    }
+
     if (rw == READ_OP) {
-        stash->rbuf = (uintptr_t) buf;
+        counter->rbuf = (uintptr_t) buf;
     } else if (rw == WRITE_OP) {
-        stash->wbuf = (uintptr_t) buf;
+        counter->wbuf = (uintptr_t) buf;
     } else {
-        printk(LOG_ERROR, "SSL_entry", "unsupported operation");
-        return 3;
+        return 4;
     }
 
     return bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
@@ -452,16 +447,22 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
     }
 
     u64 ssl_p = stash->ssl;
-    u32 ssl_c = get_count(ssl_p);
+
+    struct counter_t *counter = bpf_map_lookup_elem(&counts, &ssl_p);
+    if (counter == NULL) return 6;
+
+    u32 ssl_c = counter->count;
 
     if (rw == READ_OP) {
-        buf = (char *) (stash->rbuf);
+        buf = (char *) (counter->rbuf);
     } else if (rw == WRITE_OP) {
-        buf = (char *) (stash->wbuf);
+        buf = (char *) (counter->wbuf);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
         return cat2long(6, rw);
     }
+
+    // bpf_trace_printk("[TEST] [SSL_exit ] buf address: %p", 35, buf);
 
     for (int i = 0; i < min(n, MAX_ITERATIONS); i++) {
         buf = (char *) (buf + (i * MAX_BYTES));
@@ -484,6 +485,7 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
 
         allotted->pid = id;
         allotted->ssl_p = ssl_p;
+        allotted->ssl_c = ssl_c;
         allotted->ts = ktime;
         allotted->len = data_size;
         errno = bpf_probe_read_user(allotted->data, data_size, buf);
@@ -509,25 +511,25 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
  * @retval 1 if the underlying TLS connection has not been established (stash is NULL).
  * @retval 2 if the pill could not be submitted to any output ringbuf.
  */
-static int poison_well() {
+static int poison_well(void* ssl_p) {
     u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
+    u64 ssl = (u64) ssl_p;
 
-    struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
-    if (stash == NULL) {
-        printk(LOG_TRACE, "poison_well", "stash is NULL");
+    struct pill_t package = {
+        .len   = (u32) sizeof(u64),
+        .pid   = id,
+        .ts    = ktime,
+        .ssl_p = ssl,
+        .pill  = (u64) POISON,
+    };
+
+    struct counter_t *counter = bpf_map_lookup_elem(&counts, &ssl);
+    if (counter == NULL) {
+        printk(LOG_ERROR, "poison_well", "counter is NULL");
         return 1;
     }
-    
-    struct pill_t package = {
-        .len = (u32) sizeof(u64),
-        .pid  = id,
-        .ssl_p = stash->ssl,
-        .ssl_c = get_count(stash->ssl),
-        .ts   = ktime,
-        .pill = (u64) POISON,
-    };
-    printk(LOG_DEBUG, "poison_well", "pill ready for ringbuf");
+    package.ssl_c = counter->count;
 
     u64 package_size = sizeof(struct pill_t);
     void *allotted = bpf_ringbuf_reserve(&reads, package_size, 0);
@@ -616,22 +618,6 @@ static int connect_accept_exit(int rc, int ca) {
  * 
  */
 
-SEC("uretprobe/SSL_new")
-int BPF_URETPROBE(ret_ssl_new) {
-    void *ssl = (void *) PT_REGS_RC(ctx);
-    if (ssl == NULL) {
-        printk(LOG_DEBUG, "uetprobe/SSL_new", "ssl is NULL");
-        return 1;
-    }
-
-    if (init_count(ssl) < 0) {
-        printk(LOG_ERROR, "uretprobe/SSL_new", "failed to initialize count");
-        return 2;
-    }
-
-    return 0;
-}
-
 SEC("uprobe/SSL_connect")
 int BPF_UPROBE(entry_ssl_connect, void* ssl) {
     return connect_accept_entry(ssl, CONNECT_OP);
@@ -660,7 +646,7 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
         bpf_trace_printk(m, sizeof(m), id);
     }
 
-    if (poison_well() == 0) {
+    if (poison_well(ssl) == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_shutdown", "poison pill sent.");
     }
     if (delete_stash() == 0) {
@@ -675,7 +661,7 @@ int BPF_UPROBE(entry_ssl_free, void* ssl) {
     if (unlock_counter(ssl) == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_free", "counter unlocked successfully.");
     } else if (delete_counter(ssl) == 0) {
-        printk(LOG_DEBUG, "uprobe/SSL_free", "counter deleted successfully.");
+        printk(LOG_DEBUG, "uprobe/SSL_free", "failed to unlock counter. An attempt to delete counter was successful.");
     } else {
         printk(LOG_DEBUG, "uprobe/SSL_free", "failed to both unlock and delete counter.");
     }
@@ -689,7 +675,19 @@ int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
         const static char m[] = "[DEBUG] [uprobe/SSL_read       ]: will attempt to read from buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
-    return SSL_entry(ssl, buf, READ_OP);
+
+    int rc = SSL_entry(ssl, buf, READ_OP);
+    if (rc == 1) {
+        printk(LOG_TRACE, "SSL_read", "stash is NULL");
+    } else if (rc == 2) {
+        printk(LOG_ERROR, "SSL_read", "could initialize new counter.");
+    } else if (rc == 3) {
+        printk(LOG_ERROR, "SSL_read", "could not fetch newly initialized counter.");
+    } else if (rc == 4) {
+        printk(LOG_ERROR, "SSL_read", "unsupported operation");
+    }
+
+     return 0;
 }
 
 SEC("uprobe/SSL_write")
@@ -698,7 +696,19 @@ int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
         const static char m[] = "[DEBUG] [uprobe/SSL_write      ]: will attempt to write to buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
-    return SSL_entry(ssl, buf, WRITE_OP);
+
+    int rc = SSL_entry(ssl, buf, WRITE_OP);
+    if (rc == 1) {
+        printk(LOG_TRACE, "SSL_write", "stash is NULL");
+    } else if (rc == 2) {
+        printk(LOG_ERROR, "SSL_write", "could initialize new counter.");
+    } else if (rc == 3) {
+        printk(LOG_ERROR, "SSL_write", "could not fetch newly initialized counter.");
+    } else if (rc == 4) {
+        printk(LOG_ERROR, "SSL_write", "unsupported operation");
+    }
+
+     return 0;
 }
 
 SEC("uretprobe/SSL_read")
