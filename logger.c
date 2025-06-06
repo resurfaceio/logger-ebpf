@@ -81,20 +81,29 @@ struct pill_t {
 };
 
 /**
- * Buffer stash + SSL counter
+ * SSL counter
  * Description: keeps track of the number of times a given *SSL memory address has been
  *              (re)used, by updating a counter each time it is allocated using SSL_new.
  *              A flag lock is put in place in order to prevent unwanted modifications to 
  *              the current count. Once SSL_free is called, the corresponding counter is 
  *              unlocked. In addition, this struct keeps track of the last time the lock
- *              state was modified as a u64 timestamp, as well as references to two SSL 
- *              buffers: reads, and writes.
+ *              state was modified as a u64 timestamp.
  * [ count (32) | lock (32) | last_updated (64) | rbuf (64) | wbuf (64) ]
  */
 struct counter_t {
     u32 count;
     u32 lock;
     u64 last_updated;
+    
+};
+
+/**
+ * Buffer stash
+ * Description: one-use stash to retrieve buffer references from SSL_entry in SSL_exit.
+ * 
+ * [ rbuf (64) | wbuf (64) ]
+ */
+struct bstash_t {
     uintptr_t rbuf;
     uintptr_t wbuf;
 };
@@ -129,6 +138,13 @@ struct {
     __type(value, struct counter_t);
     __uint(max_entries, 100);
 } counts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u128);
+    __type(value, struct bstash_t);
+    __uint(max_entries, 100);
+} bufstashes SEC(".maps");
 
 /**
  *
@@ -206,7 +222,7 @@ static int enforce_bounds(int n, int lower, int upper) {
  * @brief Concatenate two integers into a long integer.
  * @param lower integer to concatenate in the lower half of the return value.
  * @param upper integer to concatenate in the upper half of the return value.
- * @return long integer of the form: [upper|lower]
+ * @return long integer of the form: [ upper | lower ]
  */
 static long cat2long(int lower, int upper) {
     long c = upper;
@@ -215,10 +231,56 @@ static long cat2long(int lower, int upper) {
 }
 
 /**
+ * @name get_joined_id
+ * @brief Concatenate PID_TGID and *SSL into a u128.
+ * @param ssl *SSL connection as a u64 integer.
+ * @return joined identifier of the form: [ pid_tgid | ssl ]
+ */
+static u128 get_joined_id(u64 ssl) {
+    u128 id = bpf_get_current_pid_tgid();
+    id <<= (sizeof(u64) * 8);
+    return id | ssl;
+}
+
+/**
  * 
  * Main functions
  * 
  */
+
+/**
+ * @name init_buf_stash
+ * @brief Initializes a buffer stash with a given SSL memory address value and the current PID_TGID
+ * 
+ * @param joined_id Current PID_TGID concatenated with *SSL, as u128 integer.
+ * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @retval 1 if counter already exists in counts map.
+ */
+static int init_buf_stash(u128 joined_id) {
+    struct bstash_t* bufs = bpf_map_lookup_elem(&bufstashes, &joined_id);
+    if (bufs != NULL) return 1;
+
+    struct bstash_t new_bufs = {
+        .rbuf  = (uintptr_t) ZERO,
+        .wbuf  = (uintptr_t) ZERO,
+    };
+    return (int) bpf_map_update_elem(&bufstashes, &joined_id, &new_bufs, BPF_NOEXIST);
+}
+
+/**
+ * @name delete_buf_stash
+ * @brief Deletes the existing buffer stash for the current PID_TGID and a given *SSL.
+ * 
+ * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
+ */
+static int delete_buf_stash(void *ssl_p) {
+    u128 jid = get_joined_id((u64) ssl_p);
+
+    struct bstash_t *bufs = bpf_map_lookup_elem(&bufstashes, &jid);
+    if (bufs == NULL) return 0;
+
+    return (int) bpf_map_delete_elem(&bufstashes, &jid);
+}
 
 /**
  * @name init_count
@@ -239,8 +301,6 @@ static long cat2long(int lower, int upper) {
         .count        = (u32) ZERO,
         .lock         = (u32) COUNTER_LOCK,
         .last_updated = ktime,
-        .rbuf         = (uintptr_t) ZERO,
-        .wbuf         = (uintptr_t) ZERO,
     };
     return (int) bpf_map_update_elem(&counts, &ssl, &new_counter, BPF_NOEXIST);
  }
@@ -337,7 +397,7 @@ static long init_stash(void* ssl) {
 
 /**
  * @name delete_stash
- * @brief Deletes the existing trace for the current pid+tgid
+ * @brief Deletes the existing trace for the current pid+tgid.
  * 
  * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
  */
@@ -388,15 +448,29 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
         if (counter == NULL) return 3;
     }
 
-    if (rw == READ_OP) {
-        counter->rbuf = (uintptr_t) buf;
-    } else if (rw == WRITE_OP) {
-        counter->wbuf = (uintptr_t) buf;
-    } else {
-        return 4;
+    u128 jid = get_joined_id(ssl);
+    struct bstash_t* bufs = bpf_map_lookup_elem(&bufstashes, &jid);
+    if (bufs == NULL) {
+        printk(LOG_DEBUG, "SSL_entry", "no joined id defined. Trying to init new bstash...");
+        if (init_buf_stash(jid) != 0) return 4;
+        bufs = bpf_map_lookup_elem(&bufstashes, &jid);
+        if (bufs == NULL) return 5;
     }
 
-    return bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
+    bpf_trace_printk("[TEST] [SSL_entry] bstash joined_id: %lx %lx", 45, (u64) jid, jid >> 64);
+
+    if (rw == READ_OP) {
+        bufs->rbuf = (uintptr_t) buf;
+    } else if (rw == WRITE_OP) {
+        bufs->wbuf = (uintptr_t) buf;
+    } else {
+        return 6;
+    }
+    
+    bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
+
+    return bpf_map_update_elem(&bufstashes, &jid, bufs, BPF_EXIST);
+
 }
 
 /**
@@ -453,10 +527,16 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
 
     u32 ssl_c = counter->count;
 
+    u128 jid = get_joined_id(ssl_p);
+    struct bstash_t *bufs = bpf_map_lookup_elem(&bufstashes, &jid);
+    if (bufs == NULL) return 7;
+
+    bpf_trace_printk("[TEST] [SSL_exit ] bstash joined_id: %lx %lx", 45, (u64) jid, jid >> 64);
+
     if (rw == READ_OP) {
-        buf = (char *) (counter->rbuf);
+        buf = (char *) (bufs->rbuf);
     } else if (rw == WRITE_OP) {
-        buf = (char *) (counter->wbuf);
+        buf = (char *) (bufs->wbuf);
     } else {
         printk(LOG_ERROR, "SSL_exit", "unsupported operation");
         return cat2long(6, rw);
@@ -529,6 +609,13 @@ static int poison_well(void* ssl_p) {
         printk(LOG_ERROR, "poison_well", "counter is NULL");
         return 1;
     }
+
+    u128 jid = get_joined_id(ssl);
+    if (bpf_map_lookup_elem(&bufstashes, &jid) == NULL) {
+        printk(LOG_ERROR, "poison_well", "pill has been sent already. Nothing to do.");
+        return 0;
+    }
+
     package.ssl_c = counter->count;
 
     u64 package_size = sizeof(struct pill_t);
@@ -651,6 +738,9 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
     }
     if (delete_stash() == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_shutdown", "stash deleted successfully.");
+    }
+    if (delete_buf_stash(ssl) == 0) {
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", "buffer stash deleted successfully.");
     }
 
     return 0;
