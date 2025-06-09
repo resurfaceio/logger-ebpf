@@ -201,7 +201,7 @@ func main() {
 				err = objs.Counts.Lookup(&jid, &counter)
 				if err != nil {
 					var id [20]byte
-					binary.LittleEndian.PutUint64(id[:16], jid)
+					copy(id[:16], jid[:])
 					binary.LittleEndian.PutUint32(id[16:], counter.Count)
 					tgid := binary.LittleEndian.Uint32(id[:4])
 					wlog.Printf(wl.TRACE, "[MAIN] Checking stash with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n",

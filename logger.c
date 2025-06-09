@@ -11,7 +11,7 @@
 #define LOG_WARN            2  // Log fatal and non-fatal errors.
 #define LOG_INFO            3  // Log errors and basic non-error details.
 #define LOG_DEBUG           4  // Log errors and non-error details.
-#define LOG_TRACE_ALL       5  // Log all details.
+#define LOG_TRACE           5  // Log all details.
 
 #define READ_OP             0
 #define WRITE_OP            1
@@ -27,7 +27,7 @@
 
 #define POISON              0x8D0003048D0304F0
 #define COUNTER_LOCK        MAX_U32_VALUE
-#define LOG_LEVEL           LOG_DEBUG
+#define LOG_LEVEL           LOG_TRACE
 
 /**
  * 
@@ -159,9 +159,6 @@ static void printk(int level, char* origin, char* message) {
         case LOG_TRACE:
             bpf_trace_printk(log, sizeof(log), "TRACE", origin, message);
             break;
-        case LOG_TRACE_ALL:
-            bpf_trace_printk(log, sizeof(log), "TRALL", origin, message);
-            break;
         default:
             bpf_trace_printk(log, sizeof(log), "?????", origin, message);
             break;
@@ -270,7 +267,7 @@ static int up_count(void* ssl_p) {
     u128 jid = get_joined_id((u64) ssl_p);
 
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
-    if (counter == NULL) return 1;
+    if (counter == NULL) return -1;
 
     if (!is_locked(counter)) {
         counter->count++;
@@ -331,10 +328,18 @@ static long init_stash(void* ssl) {
     u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
 
-    if (init_count(ssl) == 1) up_count(ssl);
+    int rc = init_count(ssl);
+    if (rc == 1) {
+        if (up_count(ssl) < 0) return 2;
+        printk(LOG_DEBUG, "init_stash", "counter is LOCKED.");
+    } else if (rc == 0) {
+        printk(LOG_DEBUG, "init_stash", "new counter initialized sucessfully.");
+    } else {
+        return cat2long(3, rc);
+    }
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
-    if (stash != NULL) return 0;
+    if (stash != NULL) return 1;
 
     struct stash_t new_stash = {
         .ssl           = (u64) ssl,
@@ -386,14 +391,14 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
 
     u64 ssl = (u64) ssl_p;
     if (stash->ssl != ssl) {
-        printk(LOG_ERROR, "SSL_entry", "stash->ssl != ssl provided. Trying to reassign to existing counter...");
+        printk(LOG_DEBUG, "SSL_entry", "stash->ssl != ssl provided. Trying to reassign to existing counter...");
         stash->ssl = ssl;
     }
 
     u128 jid = get_joined_id(ssl);
     struct counter_t* counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter == NULL) {
-        printk(LOG_ERROR, "SSL_entry", "counter is NULL. Trying to initialize new counter...");
+        printk(LOG_DEBUG, "SSL_entry", "counter is NULL. Trying to initialize new counter...");
         if (init_count(ssl_p) < 0) return 2;
 
         counter = bpf_map_lookup_elem(&counts, &jid);
@@ -539,12 +544,12 @@ static int poison_well(void* ssl_p) {
     u128 jid = get_joined_id(ssl);
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter == NULL) {
-        printk(LOG_ERROR, "poison_well", "counter is NULL");
+        printk(LOG_DEBUG, "poison_well", "counter is NULL.");
         return 1;
     }
 
     if (!is_locked(counter)) {
-        printk(LOG_ERROR, "poison_well", "pill has been sent already. Nothing to do.");
+        printk(LOG_DEBUG, "poison_well", "pill has been sent already. Nothing to do.");
         return 0;
     }
 
@@ -591,8 +596,25 @@ static int connect_accept_entry(void* ssl, int ca) {
         bpf_trace_printk(m, sizeof(m), label, id);
     }
 
-    if (init_stash(ssl) == 0) {
+    long re = init_stash(ssl);
+    switch ((int) re)
+    {
+    case 0:
         printk(LOG_DEBUG, label, "stash initialized successfully.");
+        break;
+    case 1:
+        printk(LOG_DEBUG, label, "stash already initialized. Nothing to do.");
+        break;
+    case 2:
+        printk(LOG_DEBUG, label, "failed to initialize stash; counter is NULL");
+        break;
+    case 3:
+        if (LOG_LEVEL >= LOG_DEBUG) {
+            const static char m[] = "[DEBUG] [%s   ]: failed to initialize stash; errno: %d.";
+            bpf_trace_printk(m, sizeof(m), label, re >> 32);
+        }
+    default:
+        break;
     }
 
     return 0;
@@ -611,14 +633,14 @@ static int connect_accept_entry(void* ssl, int ca) {
  */
 static int connect_accept_exit(int rc, int ca) {
     char *label = ca == CONNECT_OP ? "uretprobe/SSL_connect" : ca == ACCEPT_OP ? "uretprobe/SSL_accept " : "???";
-    if (LOG_LEVEL >= LOG_DEBUG) {
+    if (LOG_LEVEL >= LOG_TRACE) {
         const u64 id = bpf_get_current_pid_tgid();
         if (rc == 1) {
-            const static char m[] = "[DEBUG] [%s  ]: TLS/SSL handshake successfully completed for PID %d.";
+            const static char m[] = "[TRACE] [%s ]: TLS/SSL handshake successfully completed for PID %d.";
             bpf_trace_printk(m, sizeof(m), label, id);
         } else {
-            const static char m[] = "[TRACE] [%s  ]: failed to perform a TLS/SSL handshake for PID %d. Return code: %d";
-            bpf_trace_printk(m, sizeof(m), id, label, rc);
+            const static char m[] = "[TRACE] [%s ]: failed to perform a TLS/SSL handshake for PID %d. Return code: %d";
+            bpf_trace_printk(m, sizeof(m), label, id, rc);
         }
     }
 
@@ -682,20 +704,20 @@ int BPF_UPROBE(entry_ssl_free, void* ssl) {
 
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
-    if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m[] = "[DEBUG] [uprobe/SSL_read       ]: will attempt to read from buffer (%d bytes)";
+    if (LOG_LEVEL >= LOG_TRACE) {
+        const static char m[] = "[TRACE] [uprobe/SSL_read       ]: will attempt to read from buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
 
     int rc = SSL_entry(ssl, buf, READ_OP);
     if (rc == 1) {
-        printk(LOG_TRACE, "SSL_read", "stash is NULL");
+        printk(LOG_DEBUG, "SSL_read", "stash is NULL");
     } else if (rc == 2) {
-        printk(LOG_ERROR, "SSL_read", "could initialize new counter.");
+        printk(LOG_DEBUG, "SSL_read", "could initialize new counter.");
     } else if (rc == 3) {
-        printk(LOG_ERROR, "SSL_read", "could not fetch newly initialized counter.");
+        printk(LOG_DEBUG, "SSL_read", "could not fetch newly initialized counter.");
     } else if (rc == 4) {
-        printk(LOG_ERROR, "SSL_read", "counter is NOT LOCKED.");
+        printk(LOG_DEBUG, "SSL_read", "counter is NOT LOCKED.");
     } else if (rc == 5) {
         printk(LOG_ERROR, "SSL_read", "unsupported operation");
     }
@@ -705,20 +727,20 @@ int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
-    if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m[] = "[DEBUG] [uprobe/SSL_write      ]: will attempt to write to buffer (%d bytes)";
+    if (LOG_LEVEL >= LOG_TRACE) {
+        const static char m[] = "[TRACE] [uprobe/SSL_write      ]: will attempt to write to buffer (%d bytes)";
         bpf_trace_printk(m, sizeof(m), num);
     }
 
     int rc = SSL_entry(ssl, buf, WRITE_OP);
     if (rc == 1) {
-        printk(LOG_TRACE, "SSL_write", "stash is NULL");
+        printk(LOG_DEBUG, "SSL_write", "stash is NULL");
     } else if (rc == 2) {
-        printk(LOG_ERROR, "SSL_write", "could initialize new counter.");
+        printk(LOG_DEBUG, "SSL_write", "could initialize new counter.");
     } else if (rc == 3) {
-        printk(LOG_ERROR, "SSL_write", "could not fetch newly initialized counter.");
+        printk(LOG_DEBUG, "SSL_write", "could not fetch newly initialized counter.");
     } else if (rc == 4) {
-        printk(LOG_ERROR, "SSL_write", "counter is NOT LOCKED.");
+        printk(LOG_DEBUG, "SSL_write", "counter is NOT LOCKED.");
     } else if (rc == 5) {
         printk(LOG_ERROR, "SSL_write", "unsupported operation");
     }
@@ -728,8 +750,8 @@ int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
 
 SEC("uretprobe/SSL_read")
 int BPF_URETPROBE(ret_ssl_read, int n) {
-    if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m[] = "[DEBUG] [uretprobe/SSL_read    ]: read %d bytes!";
+    if (LOG_LEVEL >= LOG_TRACE) {
+        const static char m[] = "[TRACE] [uretprobe/SSL_read    ]: read %d bytes!";
         if (n > 0) {
             bpf_trace_printk(m, sizeof(m), n);
         } else {
@@ -742,22 +764,22 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
     int err = re >> 32;
 
     if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m0[] = "[DEBUG] [uretprobe/SSL_read   ]: SSL_exit - %serrno: %d";
-        const static char m1[] = "[DEBUG] [uretprobe/SSL_read   ]: SSL_exit - byte_count: %d <= 0";
-        if (rc == 1) {
+        const static char m0[] = "[DEBUG] [uretprobe/SSL_read    ]: SSL_exit: %serrno: %d";
+        const static char m1[] = "[DEBUG] [uretprobe/SSL_read    ]: SSL_exit: byte_count: %d";
+        if (rc == 1 && LOG_LEVEL >= LOG_TRACE) {
             bpf_trace_printk(m1, sizeof(m1), err);
         } else if (rc == 2) {
-            printk(LOG_TRACE, "SSL_read", "SSL_exit - stash is NULL");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: stash is NULL.");
         } else if (rc == 3) {
-            printk(LOG_TRACE, "SSL_read", "SSL_exit - count is NULL");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: count is NULL.");
         } else if (rc == 4) {
-            printk(LOG_TRACE, "SSL_read", "SSL_exit - count is NOT LOCKED");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: count is NOT LOCKED.");
         } else if (rc == 5) {
-            bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer ", err);
+            bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer: ", err);
         } else if (rc == 6) {
-            bpf_trace_printk(m0, sizeof(m0), "data could not be submitted to output buffer ", err);
+            bpf_trace_printk(m0, sizeof(m0), "data could not be submitted to output buffer: ", err);
         } else if (rc == 7) {
-            bpf_trace_printk(m0, sizeof(m0), "unsupported operation ", err);
+            bpf_trace_printk(m0, sizeof(m0), "unsupported operation: ", err);
         } else {
             bpf_trace_printk(m0, sizeof(m0), err);
         }
@@ -782,22 +804,22 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
     int err = re >> 32;
 
     if (LOG_LEVEL >= LOG_DEBUG) {
-        const static char m0[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit - %serrno: %d";
-        const static char m1[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit - byte_count: %d <= 0";
-        if (rc == 1) {
+        const static char m0[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit: %serrno: %d";
+        const static char m1[] = "[DEBUG] [uretprobe/SSL_write   ]: SSL_exit: byte_count: %d <= 0";
+        if (rc == 1 && LOG_LEVEL >= LOG_TRACE) {
             bpf_trace_printk(m1, sizeof(m1), err);
         } else if (rc == 2) {
-            printk(LOG_TRACE, "SSL_write", "SSL_exit - stash is NULL");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: stash is NULL.");
         } else if (rc == 3) {
-            printk(LOG_TRACE, "SSL_write", "SSL_exit - count is NULL");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: count is NULL.");
         } else if (rc == 4) {
-            printk(LOG_TRACE, "SSL_write", "SSL_exit - count is NOT LOCKED");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: count is NOT LOCKED.");
         } else if (rc == 5) {
-            bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer ", err);
+            bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer: ", err);
         } else if (rc == 6) {
-            bpf_trace_printk(m0, sizeof(m0), "data could not be submitted to output buffer ", err);
+            bpf_trace_printk(m0, sizeof(m0), "data could not be submitted to output buffer: ", err);
         } else if (rc == 7) {
-            bpf_trace_printk(m0, sizeof(m0), "unsupported operation ", err);
+            bpf_trace_printk(m0, sizeof(m0), "unsupported operation: ", err);
         } else {
             bpf_trace_printk(m0, sizeof(m0), err);
         }
