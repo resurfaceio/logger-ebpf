@@ -161,6 +161,7 @@ func main() {
 	var (
 		key     uint64
 		stash   loggerStashT
+		jid     [16]byte
 		counter loggerCounterT
 	)
 
@@ -193,9 +194,11 @@ func main() {
 
 			for entries.Next(&key, &stash) {
 				now := getNanoKtime()
-				delta := time.Duration(now - stash.CreatedAt)
+				delta := time.Duration(now - stash.LastModified)
 				ssl := stash.Ssl
-				err = objs.Counts.Lookup(&ssl, &counter)
+				binary.LittleEndian.PutUint64(jid[:8], key)
+				binary.LittleEndian.PutUint64(jid[8:16], ssl)
+				err = objs.Counts.Lookup(&jid, &counter)
 				if err != nil {
 					var id [20]byte
 					binary.LittleEndian.PutUint64(id[:8], key)
@@ -208,7 +211,7 @@ func main() {
 						tgid,
 						ssl,
 						counter.Count,
-						stash.CreatedAt,
+						stash.LastModified,
 						now,
 					)
 
@@ -226,11 +229,11 @@ func main() {
 
 			entries = objs.Counts.Iterate()
 
-			for entries.Next(&key, &counter) {
+			for entries.Next(&jid, &counter) {
 				delta := time.Duration(getNanoKtime() - counter.LastUpdated)
 				if delta > 3*time.Hour && counter.Lock == ^uint32(0) {
-					objs.Counts.Delete(&key)
-					wlog.Printf(wl.TRACE, "[MAIN] Counter [%016x] timed out! Count was deleted from BPF map.", key)
+					objs.Counts.Delete(&jid)
+					wlog.Printf(wl.TRACE, "[MAIN] Counter [%016x] timed out! Count was deleted from BPF map.", jid)
 				}
 
 			}
