@@ -159,7 +159,7 @@ func main() {
 	go ingest()
 
 	var (
-		key     uint64
+		pid     uint64
 		stash   loggerStashT
 		jid     [16]byte
 		counter loggerCounterT
@@ -192,22 +192,21 @@ func main() {
 		default:
 			entries := objs.Stashes.Iterate()
 
-			for entries.Next(&key, &stash) {
+			for entries.Next(&pid, &stash) {
 				now := getNanoKtime()
 				delta := time.Duration(now - stash.LastModified)
 				ssl := stash.Ssl
-				binary.LittleEndian.PutUint64(jid[:8], key)
+				binary.LittleEndian.PutUint64(jid[:8], pid)
 				binary.LittleEndian.PutUint64(jid[8:16], ssl)
 				err = objs.Counts.Lookup(&jid, &counter)
 				if err != nil {
 					var id [20]byte
-					binary.LittleEndian.PutUint64(id[:8], key)
-					binary.LittleEndian.PutUint64(id[8:16], ssl)
-					binary.LittleEndian.PutUint32(id[16:20], counter.Count)
+					binary.LittleEndian.PutUint64(id[:16], jid)
+					binary.LittleEndian.PutUint32(id[16:], counter.Count)
 					tgid := binary.LittleEndian.Uint32(id[:4])
 					wlog.Printf(wl.TRACE, "[MAIN] Checking stash with ID=[%032x], PID_TGID=[%016x] (PID=%d), and *SSL=[%016x|%08x], and TS=%d (now=%d)\n",
 						id,
-						key,
+						pid,
 						tgid,
 						ssl,
 						counter.Count,
@@ -216,7 +215,7 @@ func main() {
 					)
 
 					if _, exists := messages[id]; !exists && delta > 5*time.Second {
-						objs.Stashes.Delete(&key)
+						objs.Stashes.Delete(&pid)
 						wlog.Printf(wl.TRACE, "[MAIN] Stash [%016x] timed out! Stash was deleted from BPF map.", id)
 					}
 				}

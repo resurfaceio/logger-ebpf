@@ -11,8 +11,7 @@
 #define LOG_WARN            2  // Log fatal and non-fatal errors.
 #define LOG_INFO            3  // Log errors and basic non-error details.
 #define LOG_DEBUG           4  // Log errors and non-error details.
-#define LOG_TRACE           5  // Log almost all details, except noisy ones (i.e. "trace is NULL" and sys_close logs).
-#define LOG_TRACE_ALL       6  // Log all details.
+#define LOG_TRACE_ALL       5  // Log all details.
 
 #define READ_OP             0
 #define WRITE_OP            1
@@ -22,9 +21,9 @@
 #define ZERO                0
 #define MAX_U32_VALUE       0xFFFFFFFF
 
-#define MAX_BYTES           16384    // max 16 kiB per iteration
-#define MAX_ITERATIONS      512      // max  8 MiB per HTTPS payload
-#define RINGBUF_SIZE        16777216 // max 16 MiB per ringbuf (32 MiB in total for both req and resp)
+#define MAX_BYTES           512      // max 512   B per iteration
+#define MAX_ITERATIONS      512      // max 256 kiB per HTTPS payload
+#define RINGBUF_SIZE        16777216 // max  16 MiB per ringbuf (32 MiB in total for both req and resp)
 
 #define POISON              0x8D0003048D0304F0
 #define COUNTER_LOCK        MAX_U32_VALUE
@@ -38,10 +37,8 @@
 
 /**
  * Trace stash
- * Description: holds the value of the *SSL used to establish the TLS connection for 
- *              the underlying network connection carrying each HTTP request/response, 
- *              by stashing it throughout the TLS connection lifecycle; i.e. from 
- *              SSL_connect/accept calls, to SSL_read/write, and finally SSL_shutdown.
+ * Description: holds the value of the *SSL used to establish a given TLS connection
+ *              on top of the underlying network connection carrying each HTTP message.
  *              In addition, this struct keeps track of its initialization time as a 
  *              u64 timestamp, as well as buffer references for SSL_entry/SSL_exit.
  * 
@@ -85,11 +82,11 @@ struct pill_t {
 /**
  * SSL counter
  * Description: keeps track of the number of times a given *SSL memory address has been
- *              (re)used, by updating a counter each time it is allocated using SSL_new.
- *              A flag lock is put in place in order to prevent unwanted modifications to 
- *              the current count. Once SSL_free is called, the corresponding counter is 
- *              unlocked. In addition, this struct keeps track of the last time the lock
- *              state was modified as a u64 timestamp.
+ *              (re)used, by updating a counter each time it is used in a new connection.
+ *              A flag lock is put in place throughout the TLS connection lifecycle; i.e.
+ *              from SSL_connect/accept calls, to SSL_read/write, and finally SSL_shutdown.
+ *              Once SSL_free is called, the corresponding counter is unlocked. Staleness
+ *              is determined using the last time the counter lock state was updated.
  * [ count (32) | lock (32) | last_updated (64) | rbuf (64) | wbuf (64) ]
  */
 struct counter_t {
@@ -119,14 +116,14 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64);
     __type(value, struct stash_t);
-    __uint(max_entries, 100);
+    __uint(max_entries, 10000);
 } stashes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u128);
     __type(value, struct counter_t);
-    __uint(max_entries, 100);
+    __uint(max_entries, 10000);
 } counts SEC(".maps");
 
 /**
@@ -180,10 +177,7 @@ static void printk(int level, char* origin, char* message) {
  * @return smallest of the two arguments.
  */
 static int min(int a, int b) {
-    if (a < b) {
-        return a;
-    }
-    return b;
+    return a < b ? a : b;
 }
 
 /**
@@ -281,8 +275,8 @@ static int up_count(void* ssl_p) {
     if (!is_locked(counter)) {
         counter->count++;
         counter->lock = COUNTER_LOCK;
-        int errno = (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
-        if (errno < 0) return errno;
+//        int errno = (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
+//        if (errno < 0) return errno;
     }
     
     return counter->count;
@@ -305,10 +299,10 @@ static int unlock_counter(void* ssl_p) {
     if (is_locked(counter)) {
         counter->lock = ZERO;
         counter->last_updated = bpf_ktime_get_ns();
-        return (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
+//        return (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
     }
 
-    return 0;
+    return is_locked(counter);
 }
 
 /**
@@ -416,7 +410,8 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
         return 5;
     }
     
-    return bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
+//    return bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
+    return 0;
 }
 
 /**
