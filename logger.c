@@ -345,7 +345,7 @@ static long init_stash(void* ssl) {
 
 /**
  * @name delete_stash
- * @brief Deletes the existing trace for the current pid+tgid.
+ * @brief Deletes the existing stash for the current pid+tgid.
  * 
  * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
  */
@@ -390,10 +390,7 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
             return 1;
         } else {
             stash = bpf_map_lookup_elem(&stashes, &id);
-            if (stash == NULL) {
-                printk(LOG_DEBUG, "SSL_entry", "failed to retrieve stash");
-                return 2;
-            }
+            if (stash == NULL) return 2;
         }
     }
 
@@ -403,12 +400,6 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
     u128 jid = get_joined_id(ssl);
     struct counter_t* counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter == NULL) return 3;
-    //     printk(LOG_DEBUG, "SSL_entry", "counter is NULL. Will attempt to initialize new counter");
-    //     if (init_count(ssl_p) < 0) return 2;
-
-    //     counter = bpf_map_lookup_elem(&counts, &jid);
-    //     if (counter == NULL) return 3;
-    // }
 
     if (!is_locked(counter)) return 4;
 
@@ -494,29 +485,29 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
         }
         data_size = enforce_bounds(data_size, 0, MAX_BYTES);
 
-        struct data_t *allotted;
+        struct data_t *reserved;
         if (rw == READ_OP) {
-            allotted = bpf_ringbuf_reserve(&reads, sizeof(struct data_t), 0);
-            if (allotted == NULL) return 5;
+            reserved = bpf_ringbuf_reserve(&reads, sizeof(struct data_t), 0);
+            if (reserved == NULL) return 5;
         } else if (rw == WRITE_OP) {
-            allotted = bpf_ringbuf_reserve(&writes, sizeof(struct data_t), 0);
-            if (allotted == NULL) return 5;
+            reserved = bpf_ringbuf_reserve(&writes, sizeof(struct data_t), 0);
+            if (reserved == NULL) return 5;
         } else {
             return cat2long(7, rw);
         }
 
-        allotted->pid = id;
-        allotted->ssl_p = ssl_p;
-        allotted->ssl_c = ssl_c;
-        allotted->ts = ktime;
-        allotted->len = data_size;
-        errno = bpf_probe_read_user(allotted->data, data_size, buf);
+        reserved->pid = id;
+        reserved->ssl_p = ssl_p;
+        reserved->ssl_c = ssl_c;
+        reserved->ts = ktime;
+        reserved->len = data_size;
+        errno = bpf_probe_read_user(reserved->data, data_size, buf);
         if (errno < 0) {
-            bpf_ringbuf_discard(allotted, 0);
+            bpf_ringbuf_discard(reserved, 0);
             return cat2long(6, (int) errno);
         }
 
-        bpf_ringbuf_submit(allotted, 0);
+        bpf_ringbuf_submit(reserved, 0);
     }
 
     return 0;
@@ -530,7 +521,7 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
  * 
  * @return Propagates return value from bpf_map_read_kernel (0 on success, or a negative value in case of failure).
  * @retval 0 if the pill was successfully submitted to all output ringbufs.
- * @retval 1 if the underlying TLS connection has not been recognized (count is NULL).
+ * @retval 1 if the underlying TLS connection has not been established (count is NULL).
  * @retval 2 if the pill could not be submitted to any output ringbuf.
  */
 static int poison_well(void* ssl_p) {
@@ -548,10 +539,7 @@ static int poison_well(void* ssl_p) {
 
     u128 jid = get_joined_id(ssl);
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
-    if (counter == NULL) {
-        printk(LOG_DEBUG, "poison_well", "counter is NULL");
-        return 1;
-    }
+    if (counter == NULL) return 1;
 
     if (!is_locked(counter)) {
         printk(LOG_TRACE, "poison_well", "pill has been sent already. Nothing to do");
@@ -561,23 +549,23 @@ static int poison_well(void* ssl_p) {
     package.ssl_c = counter->count;
 
     u64 package_size = sizeof(struct pill_t);
-    void *allotted = bpf_ringbuf_reserve(&reads, package_size, 0);
-    if (allotted == NULL) return 2;
-    int errno = bpf_probe_read_kernel(allotted, package_size, &package);
+    void *reserved = bpf_ringbuf_reserve(&reads, package_size, 0);
+    if (reserved == NULL) return 2;
+    int errno = bpf_probe_read_kernel(reserved, package_size, &package);
     if (errno) {
-        bpf_ringbuf_discard(allotted, 0);
+        bpf_ringbuf_discard(reserved, 0);
         return errno;
     }
-    bpf_ringbuf_submit(allotted, 0);
+    bpf_ringbuf_submit(reserved, 0);
 
-    allotted = bpf_ringbuf_reserve(&writes, package_size, 0);
-    if (allotted == NULL) return 2;
-    errno = bpf_probe_read_kernel(allotted, package_size, &package);
+    reserved = bpf_ringbuf_reserve(&writes, package_size, 0);
+    if (reserved == NULL) return 2;
+    errno = bpf_probe_read_kernel(reserved, package_size, &package);
     if (errno) {
-        bpf_ringbuf_discard(allotted, 0);
+        bpf_ringbuf_discard(reserved, 0);
         return errno;
     }
-    bpf_ringbuf_submit(allotted, 0);
+    bpf_ringbuf_submit(reserved, 0);
 
     return 0;
 }
@@ -607,15 +595,14 @@ static int connect_accept_entry(void* ssl, int ca) {
     } else if (re == 1) {
         if (up_count(ssl) < 0) {
             printk(LOG_DEBUG, label, "failed to retrieve counter");
-            return 1;
+        } else {
+            printk(LOG_TRACE, label, "counter is LOCKED");
         }
-        printk(LOG_TRACE, label, "counter is LOCKED");
     } else {
         if (LOG_LEVEL >= LOG_DEBUG) {
             const static char m[] = "[DEBUG] [%s   ]: failed to initialize counter; errno: %d.";
             bpf_trace_printk(m, sizeof(m), label, re >> 32);
         }
-        return 1;
     }
 
     return 0;
@@ -683,8 +670,12 @@ int BPF_UPROBE(entry_ssl_shutdown, void* ssl) {
         bpf_trace_printk(m, sizeof(m), id);
     }
 
-    if (poison_well(ssl) == 0) {
+    int rc = poison_well(ssl);
+
+    if (rc == 0) {
         printk(LOG_DEBUG, "uprobe/SSL_shutdown", "poison pill sent.");
+    } else if (rc == 1) {
+        printk(LOG_DEBUG, "uprobe/SSL_shutdown", "counter is NULL");
     }
 
     return 0;
@@ -712,13 +703,13 @@ int BPF_UPROBE(entry_ssl_read, void* ssl, void *buf, int num) {
 
     int rc = SSL_entry(ssl, buf, READ_OP);
     if (rc == 1) {
-        printk(LOG_DEBUG, "SSL_read", "stash is NULL");
+        printk(LOG_DEBUG, "SSL_read", "stash is NULL. Failed to initialize stash");
     } else if (rc == 2) {
-        printk(LOG_DEBUG, "SSL_read", "could initialize new counter.");
+        printk(LOG_DEBUG, "SSL_read", "stash is NULL. Failed to retrieve stash");
     } else if (rc == 3) {
-        printk(LOG_DEBUG, "SSL_read", "could not fetch newly initialized counter.");
+        printk(LOG_DEBUG, "SSL_read", "counter is NULL");
     } else if (rc == 4) {
-        printk(LOG_DEBUG, "SSL_read", "counter is NOT LOCKED.");
+        printk(LOG_DEBUG, "SSL_read", "counter is NOT LOCKED");
     } else if (rc == 5) {
         printk(LOG_ERROR, "SSL_read", "unsupported operation");
     }
@@ -734,14 +725,12 @@ int BPF_UPROBE(entry_ssl_write, void* ssl, void *buf, int num) {
     }
 
     int rc = SSL_entry(ssl, buf, WRITE_OP);
-    if (rc == 1) {
+    if (rc == 1 || rc == 2) {
         printk(LOG_DEBUG, "SSL_write", "stash is NULL");
-    } else if (rc == 2) {
-        printk(LOG_DEBUG, "SSL_write", "could initialize new counter.");
     } else if (rc == 3) {
-        printk(LOG_DEBUG, "SSL_write", "could not fetch newly initialized counter.");
+        printk(LOG_DEBUG, "SSL_write", "counter is NULL");
     } else if (rc == 4) {
-        printk(LOG_DEBUG, "SSL_write", "counter is NOT LOCKED.");
+        printk(LOG_DEBUG, "SSL_write", "counter is NOT LOCKED");
     } else if (rc == 5) {
         printk(LOG_ERROR, "SSL_write", "unsupported operation");
     }
@@ -770,11 +759,11 @@ int BPF_URETPROBE(ret_ssl_read, int n) {
         if (rc == 1 && LOG_LEVEL >= LOG_TRACE) {
             bpf_trace_printk(m1, sizeof(m1), err);
         } else if (rc == 2) {
-            printk(LOG_DEBUG, "SSL_read", "SSL_exit: stash is NULL.");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: stash is NULL");
         } else if (rc == 3) {
-            printk(LOG_DEBUG, "SSL_read", "SSL_exit: count is NULL.");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: counter is NULL");
         } else if (rc == 4) {
-            printk(LOG_DEBUG, "SSL_read", "SSL_exit: count is NOT LOCKED.");
+            printk(LOG_DEBUG, "SSL_read", "SSL_exit: counter is NOT LOCKED");
         } else if (rc == 5) {
             bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer: ", err);
         } else if (rc == 6) {
@@ -810,11 +799,11 @@ int BPF_URETPROBE(ret_ssl_write, int n) {
         if (rc == 1 && LOG_LEVEL >= LOG_TRACE) {
             bpf_trace_printk(m1, sizeof(m1), err);
         } else if (rc == 2) {
-            printk(LOG_DEBUG, "SSL_write", "SSL_exit: stash is NULL.");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: stash is NULL");
         } else if (rc == 3) {
-            printk(LOG_DEBUG, "SSL_write", "SSL_exit: count is NULL.");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: counter is NULL");
         } else if (rc == 4) {
-            printk(LOG_DEBUG, "SSL_write", "SSL_exit: count is NOT LOCKED.");
+            printk(LOG_DEBUG, "SSL_write", "SSL_exit: counter is NOT LOCKED");
         } else if (rc == 5) {
             bpf_trace_printk(m0, sizeof(m0), "data could not be read from stashed buffer: ", err);
         } else if (rc == 6) {
