@@ -318,22 +318,13 @@ static long delete_counter(void *ssl_p) {
  * @name init_stash
  * @brief Initializes a stash with the current given pid+tgid, and a given SSL memory address value.
  * 
- * @param ssl *SSL Connection to trace.
+ * @param ssl *SSL Connection to stash.
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @retval 1 if stash already exists in stashes map.
  */
 static long init_stash(void* ssl) {
     u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
-
-    long rc = init_count(ssl);
-    if (rc == 1) {
-        if (up_count(ssl) < 0) return 2;
-        printk(LOG_TRACE, "init_stash", "counter is LOCKED");
-    } else if (rc == 0) {
-        printk(LOG_TRACE, "init_stash", "new counter initialized sucessfully");
-    } else {
-        return cat2long(3, rc);
-    }
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
     if (stash != NULL) {
@@ -375,9 +366,9 @@ static long delete_stash() {
  * 
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  * @retval 0 if the reference was stashed successfully.
- * @retval 1 if stash is NULL as the underlying TLS connection has not been established.
- * @retval 2 if count is NULL as the underlying TLS connection has not been recognized (could not init new counter).
- * @retval 3 if count is NULL as the underlying TLS connection has not been recognized (could not fetch newly initd counter).
+ * @retval 1 if stash is NULL and could not be intiialized.
+ * @retval 2 if stash was initialized but could not be retrieved.
+ * @retval 3 if count is NULL as the underlying TLS connection has not been established.
  * @retval 4 if count is NOT LOCKED as the underlying TLS connection has not been established.
  * @retval 5 if the operation specified by rw is not supported.
  */
@@ -387,24 +378,37 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
     // bpf_trace_printk("[TEST] [SSL_entry] buf address: %p", 35, buf);
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
-    if (stash == NULL) return 1;
-    stash->last_accessed = bpf_ktime_get_ns();
+    if (stash != NULL) {
+        stash->last_accessed = bpf_ktime_get_ns();
+    } else {
+        long rc = init_stash(ssl_p);
+        if (rc < 0) {
+            if (LOG_LEVEL >= LOG_DEBUG) {
+                const static char m[] = "[DEBUG] [SSL_entry   ]: failed to initialize stash; rc: %d.";
+                bpf_trace_printk(m, sizeof(m), rc);
+            }
+            return 1;
+        } else {
+            stash = bpf_map_lookup_elem(&stashes, &id);
+            if (stash == NULL) {
+                printk(LOG_DEBUG, "SSL_entry", "failed to retrieve stash");
+                return 2;
+            }
+        }
+    }
 
     u64 ssl = (u64) ssl_p;
-    if (stash->ssl != ssl) {
-        printk(LOG_TRACE, "SSL_entry", "Will attempt to reassign to stashed ssl (stash->ssl != ssl)");
-        stash->ssl = ssl;
-    }
+    if (stash->ssl != ssl) stash->ssl = ssl;
 
     u128 jid = get_joined_id(ssl);
     struct counter_t* counter = bpf_map_lookup_elem(&counts, &jid);
-    if (counter == NULL) {
-        printk(LOG_DEBUG, "SSL_entry", "Will attempt to initialize new counter (counter is NULL)");
-        if (init_count(ssl_p) < 0) return 2;
+    if (counter == NULL) return 3;
+    //     printk(LOG_DEBUG, "SSL_entry", "counter is NULL. Will attempt to initialize new counter");
+    //     if (init_count(ssl_p) < 0) return 2;
 
-        counter = bpf_map_lookup_elem(&counts, &jid);
-        if (counter == NULL) return 3;
-    }
+    //     counter = bpf_map_lookup_elem(&counts, &jid);
+    //     if (counter == NULL) return 3;
+    // }
 
     if (!is_locked(counter)) return 4;
 
@@ -416,7 +420,6 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
         return 5;
     }
     
-//    return bpf_map_update_elem(&stashes, &id, stash, BPF_EXIST);
     return 0;
 }
 
@@ -598,25 +601,21 @@ static int connect_accept_entry(void* ssl, int ca) {
         bpf_trace_printk(m, sizeof(m), label, id);
     }
 
-    long re = init_stash(ssl);
-    switch ((int) re)
-    {
-    case 0:
-        printk(LOG_TRACE, label, "stash initialized successfully.");
-        break;
-    case 1:
-        printk(LOG_TRACE, label, "stash already initialized. Nothing to do.");
-        break;
-    case 2:
-        printk(LOG_DEBUG, label, "failed to initialize stash; counter is NULL");
-        break;
-    case 3:
+    long re = init_count(ssl);
+    if (re == 0) {
+        printk(LOG_TRACE, label, "new counter initialized sucessfully");
+    } else if (re == 1) {
+        if (up_count(ssl) < 0) {
+            printk(LOG_DEBUG, label, "failed to retrieve counter");
+            return 1;
+        }
+        printk(LOG_TRACE, label, "counter is LOCKED");
+    } else {
         if (LOG_LEVEL >= LOG_DEBUG) {
-            const static char m[] = "[DEBUG] [%s   ]: failed to initialize stash; errno: %d.";
+            const static char m[] = "[DEBUG] [%s   ]: failed to initialize counter; errno: %d.";
             bpf_trace_printk(m, sizeof(m), label, re >> 32);
         }
-    default:
-        break;
+        return 1;
     }
 
     return 0;
