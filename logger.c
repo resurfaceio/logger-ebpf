@@ -39,14 +39,15 @@
  * Trace stash
  * Description: holds the value of the *SSL used to establish a given TLS connection
  *              on top of the underlying network connection carrying each HTTP message.
- *              In addition, this struct keeps track of its initialization time as a 
- *              u64 timestamp, as well as buffer references for SSL_entry/SSL_exit.
+ *              This reference together with references to r/w buffer addresses are
+ *              stashed between SSL_entry and SSL_exit calls. In addition, this struct
+ *              keeps track of the time it was last accessed as a u64 timestamp.
  * 
  * [  ssl (64) | created_at (64) | rbuf (64) | wbuf (64) ]
  */
 struct stash_t {
     u64 ssl;
-    u64 last_modified;
+    u64 last_accessed;
     uintptr_t rbuf;
     uintptr_t wbuf;
 };
@@ -87,13 +88,12 @@ struct pill_t {
  *              from SSL_connect/accept calls, to SSL_read/write, and finally SSL_shutdown.
  *              Once SSL_free is called, the corresponding counter is unlocked. Staleness
  *              is determined using the last time the counter lock state was updated.
- * [ count (32) | lock (32) | last_updated (64) | rbuf (64) | wbuf (64) ]
+ * [ count (32) | lock (32) | last_updated (64) ]
  */
 struct counter_t {
     u32 count;
     u32 lock;
     u64 last_updated;
-    
 };
 
 /**
@@ -241,9 +241,8 @@ static int is_locked(struct counter_t *c) {
  * @return Propagates return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
  * @retval 1 if counter already exists in counts map.
  */
- static int init_count(void* ssl_p) {
-     u64 ktime = bpf_ktime_get_ns();
-     u128 jid = get_joined_id((u64) ssl_p);
+ static long init_count(void* ssl_p) {
+    u128 jid = get_joined_id((u64) ssl_p);
 
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter != NULL) return 1;
@@ -251,9 +250,9 @@ static int is_locked(struct counter_t *c) {
     struct counter_t new_counter = {
         .count        = (u32) ZERO,
         .lock         = (u32) COUNTER_LOCK,
-        .last_updated = ktime,
+        .last_updated = bpf_ktime_get_ns(),
     };
-    return (int) bpf_map_update_elem(&counts, &jid, &new_counter, BPF_NOEXIST);
+    return bpf_map_update_elem(&counts, &jid, &new_counter, BPF_NOEXIST);
  }
 
  /**
@@ -261,7 +260,8 @@ static int is_locked(struct counter_t *c) {
  * @brief Increases the count for a given *SSL, if counter is unlocked. Does nothing if counter is locked.
  * 
  * @param ssl *SSL connection to trace.
- * @return Current count if positive, or propagated return value from bpf_map_update_elem (0 on success, or a negative value in case of failure).
+ * @return Current count.
+ * @retval -1 if counter does not exist in counts map.
  */
 static int up_count(void* ssl_p) {
     u128 jid = get_joined_id((u64) ssl_p);
@@ -272,8 +272,6 @@ static int up_count(void* ssl_p) {
     if (!is_locked(counter)) {
         counter->count++;
         counter->lock = COUNTER_LOCK;
-//        int errno = (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
-//        if (errno < 0) return errno;
     }
     
     return counter->count;
@@ -284,19 +282,18 @@ static int up_count(void* ssl_p) {
  * @brief Unlocks the counter for a given *SSL.
  * 
  * @param ssl *SSL Connection with counter to be unlocked.
- * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
- * @retval 1 if count does not exist in map.
+ * @return Current state of the lock.
+ * @retval -1 if counter does not exist in counts map.
  */
 static int unlock_counter(void* ssl_p) {
     u128 jid = get_joined_id((u64) ssl_p);
 
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
-    if (counter == NULL) return 1;
+    if (counter == NULL) return -1;
 
     if (is_locked(counter)) {
         counter->lock = ZERO;
         counter->last_updated = bpf_ktime_get_ns();
-//        return (int) bpf_map_update_elem(&counts, &jid, counter, BPF_EXIST);
     }
 
     return is_locked(counter);
@@ -308,13 +305,13 @@ static int unlock_counter(void* ssl_p) {
  * 
  * @return Propagates return value from bpf_map_delete_elem (0 on success, or a negative value in case of failure).
  */
-static int delete_counter(void *ssl_p) {
+static long delete_counter(void *ssl_p) {
     u64 ssl = (u64) ssl_p;
 
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &ssl);
     if (counter == NULL) return 0;
 
-    return (int) bpf_map_delete_elem(&counts, &ssl);
+    return bpf_map_delete_elem(&counts, &ssl);
 }
 
 /**
@@ -328,22 +325,25 @@ static long init_stash(void* ssl) {
     u64 ktime = bpf_ktime_get_ns();
     u64 id = bpf_get_current_pid_tgid();
 
-    int rc = init_count(ssl);
+    long rc = init_count(ssl);
     if (rc == 1) {
         if (up_count(ssl) < 0) return 2;
-        printk(LOG_DEBUG, "init_stash", "counter is LOCKED.");
+        printk(LOG_TRACE, "init_stash", "counter is LOCKED");
     } else if (rc == 0) {
-        printk(LOG_DEBUG, "init_stash", "new counter initialized sucessfully.");
+        printk(LOG_TRACE, "init_stash", "new counter initialized sucessfully");
     } else {
         return cat2long(3, rc);
     }
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
-    if (stash != NULL) return 1;
+    if (stash != NULL) {
+        stash->last_accessed = ktime;
+        return 1;
+    }
 
     struct stash_t new_stash = {
         .ssl           = (u64) ssl,
-        .last_modified = (u64) ktime,
+        .last_accessed = ktime,
         .rbuf          = (uintptr_t) ZERO,
         .wbuf          = (uintptr_t) ZERO,
     };
@@ -388,17 +388,18 @@ static int SSL_entry(void* ssl_p, void *buf, int rw) {
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
     if (stash == NULL) return 1;
+    stash->last_accessed = bpf_ktime_get_ns();
 
     u64 ssl = (u64) ssl_p;
     if (stash->ssl != ssl) {
-        printk(LOG_DEBUG, "SSL_entry", "stash->ssl != ssl provided. Trying to reassign to existing counter...");
+        printk(LOG_TRACE, "SSL_entry", "Will attempt to reassign to stashed ssl (stash->ssl != ssl)");
         stash->ssl = ssl;
     }
 
     u128 jid = get_joined_id(ssl);
     struct counter_t* counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter == NULL) {
-        printk(LOG_DEBUG, "SSL_entry", "counter is NULL. Trying to initialize new counter...");
+        printk(LOG_DEBUG, "SSL_entry", "Will attempt to initialize new counter (counter is NULL)");
         if (init_count(ssl_p) < 0) return 2;
 
         counter = bpf_map_lookup_elem(&counts, &jid);
@@ -461,6 +462,7 @@ static long SSL_exit(struct pt_regs *ctx, int rw) {
 
     struct stash_t* stash = bpf_map_lookup_elem(&stashes, &id);
     if (stash == NULL) return 2;
+    stash->last_accessed = ktime;
 
     u64 ssl_p = stash->ssl;
 
@@ -544,12 +546,12 @@ static int poison_well(void* ssl_p) {
     u128 jid = get_joined_id(ssl);
     struct counter_t *counter = bpf_map_lookup_elem(&counts, &jid);
     if (counter == NULL) {
-        printk(LOG_DEBUG, "poison_well", "counter is NULL.");
+        printk(LOG_DEBUG, "poison_well", "counter is NULL");
         return 1;
     }
 
     if (!is_locked(counter)) {
-        printk(LOG_DEBUG, "poison_well", "pill has been sent already. Nothing to do.");
+        printk(LOG_TRACE, "poison_well", "pill has been sent already. Nothing to do");
         return 0;
     }
 
@@ -600,10 +602,10 @@ static int connect_accept_entry(void* ssl, int ca) {
     switch ((int) re)
     {
     case 0:
-        printk(LOG_DEBUG, label, "stash initialized successfully.");
+        printk(LOG_TRACE, label, "stash initialized successfully.");
         break;
     case 1:
-        printk(LOG_DEBUG, label, "stash already initialized. Nothing to do.");
+        printk(LOG_TRACE, label, "stash already initialized. Nothing to do.");
         break;
     case 2:
         printk(LOG_DEBUG, label, "failed to initialize stash; counter is NULL");
