@@ -213,7 +213,7 @@ func main() {
 						now,
 					)
 
-					if _, exists := messages[id]; !exists && delta > 5*time.Second {
+					if _, exists := messages[id]; !exists && delta > 1*time.Minute {
 						objs.Stashes.Delete(&pid)
 						wlog.Printf(wl.TRACE, "[MAIN] Stash [%016x] timed out! Stash was deleted from BPF map.", id)
 					}
@@ -241,7 +241,7 @@ func main() {
 				return
 			}
 
-			time.Sleep(3 * time.Second)
+			time.Sleep(10 * time.Second)
 		}
 	}
 }
